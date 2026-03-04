@@ -1,0 +1,23 @@
+# config/grafana/provisioning/datasources/datasources.yml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    uid: "prometheus-main"
+    jsonData:
+      # Sets the minimum query step to match the scrape interval (15s).
+      timeInterval: "15s"
+      httpMethod: POST
+      manageAlerts: true
+    
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    uid: "loki-main"
+    jsonData:
+      maxLines: 1000

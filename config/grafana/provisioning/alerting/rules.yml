@@ -1,0 +1,92 @@
+# config/grafana/provisioning/alerting/rules.yml
+apiVersion: 1
+
+groups:
+  - name: HostAlerts
+    folder: "host_alerts"
+    interval: 1m
+    rules:
+      - uid: host_high_cpu
+        title: Host High CPU Usage
+        # Handle missing data gracefully --- if the metric is missing, 
+        # do not fire an alert.
+        noDataState: OK
+        execErrState: Error
+        condition: C
+        for: 5m
+        annotations:
+          summary: "Host CPU usage is over 85%"
+          description: "High CPU usage detected on host: {{ or $labels.instance \"Unknown\" }}. Current value: {{ if $values.B }}{{ $values.B.Value | printf \"%.2f\" }}%{{ else }}N/A{{ end }}."
+            #description: "High CPU usage detected on host: {{ $labels.instance }}. Current value: {{ $values.B.Value | printf \"%.2f\" }}%."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            datasourceUid: "prometheus-main"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            model:
+              editorMode: code
+              type: expression
+              # CPU Usage in Percentages.
+              expr: |
+                100 * (1 - avg by(instance) (rate(node_cpu_seconds_total{mode="idle", job="integrations/unix"}[1m])))
+              instant: true
+              intervalMs: 15000 
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: "__expr__"
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            datasourceUid: "__expr__"
+            model:
+              type: math
+              expression: $B > 85
+
+      - uid: host_high_memory
+        title: Host High Memory Usage
+        # Handle missing data gracefully --- if the metric is missing, 
+        # do not fire an alert.
+        noDataState: OK
+        execErrState: Error
+        condition: C
+        for: 5m
+        annotations:
+          summary: Host memory usage is over 85%
+          description: "High memory usage detected on host: {{ or $labels.instance \"Unknown\" }}. Current value: {{ if $values.B }}{{ $values.B.Value | printf \"%.2f\" }}%{{ else }}N/A{{ end }}."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            datasourceUid: "prometheus-main"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            model:
+              editorMode: code
+              type: expression
+              # 
+              expr: |
+                100 * (1 - (node_memory_MemAvailable_bytes{job="integrations/unix"} / node_memory_MemTotal_bytes{job="integrations/unix"}))
+              instant: true
+              intervalMs: 15000 
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: "__expr__"
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+              settings:
+                mode: dropNN
+          - refId: C
+            datasourceUid: "__expr__"
+            model:
+              type: math
+              expression: $B > 85

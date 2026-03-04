@@ -1,0 +1,62 @@
+# ==============================================================================
+# DS Platform --- Automatically Generated `.gitignore`
+# ------------------------------------------------------------------------------
+# Accounts for both JupyterHub-based and Local-based Git workflow.
+# ==============================================================================
+
+# --- Jupyter & Python Artifacts ---
+# Checkpoints are local history and should not be shared or versioned.
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# Python bytecode and optimization files.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Environment & Packaging (uv) ---
+# The platform provides a managed system environment. Local virtual environments
+# are non-portable and should not be committed.
+.venv/
+venv/
+ENV/
+
+# Build artifacts from 'uv build'.
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# uv cache directories (if generated locally).
+.cache/
+
+# --- Platform Injections ---
+# Helper scripts injected by the infrastructure are machine-specific
+# and should not be tracked in version control.
+del_proj_dir.sh
+
+# --- Security ---
+# Prevent accidental commit of local environment secrets.
+.env
+.env.*
+!.env.example
+
+# --- Editor & IDE Configuration ---
+# Exclude artifacts from common editors users might utilize remotely.
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Tooling Caches ---
+# These tools might generate cache directories in the project root during execution.
+.ruff_cache/
+.pytest_cache/ # In case `pytest` is added
+
+# --- Data Guardrails ---
+# Git is not optimized for large binary datasets.
+data/
+outputs/
+models/

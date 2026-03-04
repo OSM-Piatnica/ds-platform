@@ -1,0 +1,34 @@
+# config/grafana/provisioning/alerting/contact-point.yml.j2
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: ms-teams-contact-point
+    receivers:
+      - uid: teams-receiver
+        type: teams
+        settings:
+          # Inject the secret URL from the vault.
+          # This URL must be generated via Power Automate Workflows:
+          # Teams -> Workflows (App) -> Generate webhook (channel or chat)
+          url: "{{ ms_teams_webhook_url }}"
+          # Custom Template for cleaner messages.
+          # This defines a clean title and a loop for the message body
+          # that only shows the specific details.
+          title: |
+            {% raw %}
+            {{ if eq .Status "firing" }}--FIRING--{{ else }}--RESOLVED--{{ end }}
+            [{{ .Status | toUpper }}] {{ .CommonAnnotations.summary }}
+            {% endraw %}
+          message: |
+            {% raw %}
+            {{ range .Alerts }}
+            **Alert:** {{ .Annotations.summary }}
+            **Description:** {{ .Annotations.description }}
+            **Severity:** {{ .Labels.severity }}
+            **Status:** {{ .Status }}
+            [View in Grafana]({{ .GeneratorURL }})
+
+            ---
+            {{ end }}
+            {% endraw %}

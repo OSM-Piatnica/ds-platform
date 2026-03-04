@@ -1,0 +1,228 @@
+# ansible/group_vars/all.yml
+
+---
+parent_domain: mydomain.com
+cert_pem: cert.pem
+cert_key: cert.key
+# `playbook_dir` is a magic variable whose output is 
+# a path to the directory of the running Playbook.
+# Adding `| dirname` moves up one level in directory hierarchy
+# (otherwise we'd end up in `*/ansible`).
+project_root: "{{ playbook_dir | dirname }}"
+
+# =========================================================================
+# GIT REPO INFO
+# =========================================================================
+
+# Account where platform's repository resides.
+git_account: osm-piatnica
+
+# Name of platform's repository.
+repo_name: ds-platform
+
+# Maintainer contact.
+maintainer_email: damian.kozlowski@piatnica.com.pl
+
+# =============================================================================
+# INFRASTRUCTURE FEATURE FLAGS
+# =============================================================================
+
+# Custom Certificate TLS Configuration
+# Set to `true` if you have your own certificate files (e.g., corporate
+# wildcard) provided in `secrets/certs/`.
+# Set to `false` to let Caddy obtain certificates automatically (Let's
+# Encrypt).
+use_custom_certs: true
+
+# Email for Let's Encrypt registration (required if `use_custom_certs` is
+# false).
+acme_email: "admin@example.com"
+
+# Debian Mirror URL
+# Default: deb.debian.org
+# Change to a local mirror (e.g., ftp.pl.debian.org) for faster local builds.
+debian_mirror_url: "deb.debian.org"
+
+# Message of the Day
+# The content of variable is injected into the bash script.
+motd: |
+  if [ -x "$(command -v cowsay)" ]; then
+      cowsay -n <<EOF
+  Hello!
+  EOF
+  fi
+
+# Microsoft SQL Server Drivers
+# Set to `true` if you intend to use MS SQL Server, for example as a Data
+# Warehouse.
+install_mssql_drivers: false
+
+# =============================================================================
+# JUPYTER IMAGE MANAGEMENT
+# =============================================================================
+
+ds_image_deps:
+  dev:
+    - "ruff"                   # Extremely fast Python linter and formatter written in Rust.
+    - "jupyter-ruff"           # Integrates Ruff directly into Jupyter notebook cells.
+    - "basedpyright"           # Static type checking backend.
+    - "jupyter-lsp"            # Backend support for Language Server Protocol in Jupyter.
+    - "jupyterlab-lsp"         # Frontend UI for autocompletion, hover documentation, and diagnostics.
+    - "jupyter-resource-usage" # Monitors CPU/RAM utilization directly within the Jupyter UI.
+    - "jupyterlab-git"         # Graphical interface for Forgejo Git operations.
+    - "jupytext"               # Auto-pairs.ipynb notebooks with clean.py scripts for Git version control.
+
+  base:
+    - "jupyterhub==5.*"        # The core multi-user server orchestrator (pinned for DB stability).
+    - "jupyterlab==4.*"        # The modern web-based interactive development environment.
+    - "ipykernel"              # Execution backend for running Python code in notebooks.
+    - "jupyter-collaboration"  # Enables Real-Time Collaboration (RTC) features on shared accounts.
+
+  basic_cpu:
+    - "numpy"                  # Fundamental package for array computing.
+    - "pandas"                 # Standard data manipulation and analysis library.
+    - "tqdm"                   # Fast, extensible progress bar for loops and data processing.
+    - "ipdb"                   # Interactive IPython debugger.
+    - "numba"                  # JIT compiler that translates Python functions to optimized machine code.
+    - "openpyxl"               # Library to read/write Excel 2010 xlsx/xlsm files.
+    - "pyarrow"                # In-memory columnar data format, crucial for fast I/O and Parquet support.
+    - "psycopg"                # Modern PostgreSQL database adapter for Python.
+    - "sqlalchemy"             # Database toolkit and Object Relational Mapper (ORM).
+    - "requests"               # Elegant HTTP library for API interactions.
+    - "matplotlib"             # Comprehensive library for creating static, animated, and interactive visualizations.
+    - "seaborn"                # Statistical data visualization based on matplotlib.
+    - "ipympl"                 # Enables interactive matplotlib plots within Jupyter Notebooks.
+    - "ipywidgets"             # Interactive HTML widgets for Jupyter Notebooks.
+    - "plotly"                 # Declarative interactive graphing library.
+    - "anywidget"              # Simplifies creation of custom Jupyter widgets (used by Lonboard).
+    - "polars[rtcompat]"       # Blazing fast DataFrame library written in Rust. 'rtcompat' ensures fallback for older CPUs lacking AVX features.
+    - "duckdb"                 # In-process SQL OLAP database management system for extremely fast local analytics.
+    - "s3fs"                   # Pythonic file interface to S3-compatible object storage (e.g., MinIO/AWS).
+
+  big_data_cpu:
+    - "dask[complete]"         # Parallel computing library that scales Pandas and NumPy operations across CPU cores.
+
+  ml_cpu:
+    - "scipy"                  # Fundamental algorithms for scientific computing.
+    - "scikit-learn"           # Industry standard machine learning library for classification, regression, and clustering.
+    - "xgboost"                # Optimized distributed gradient boosting library.
+    - "lightgbm"               # Fast, distributed, high-performance gradient boosting framework based on decision tree algorithms.
+    - "catboost"               # Gradient boosting on decision trees with native handling of categorical features.
+    - "optuna"                 # Hyperparameter optimization framework using define-by-run API.
+    - "imbalanced-learn"       # Tools for classification with imbalanced classes (SMOTE, ADASYN).
+    - "umap-learn"             # Uniform Manifold Approximation and Projection for dimensionality reduction.
+    - "shap"                   # SHapley Additive exPlanations for model interpretability and feature importance.
+
+  optimization_cpu:
+    - "ortools"                # Google's open-source software suite for optimization (routing, constraint programming).
+    - "gekko"                  # Large-scale non-linear, mixed-integer, and dynamic optimization framework.
+    - "cvxpy"                  # Domain-specific language for modeling and solving convex optimization problems.
+
+  time_series_cpu:
+    - "prophet"                # Meta's procedure for forecasting time series data based on an additive model.
+    - "sktime"                 # Unified framework for machine learning with time series (classification, regression).
+    - "darts"                  # User-friendly library for forecasting and anomaly detection on time series.
+    # --- Nixtla Stack ---
+    - "statsforecast"          # Blazing fast implementation of statistical forecasting models (ARIMA, ETS).
+    - "mlforecast"             # Framework to perform time series forecasting using machine learning models (XGBoost, LightGBM).
+    - "neuralforecast"         # State-of-the-art neural network forecasting architectures (N-BEATS, TFT).
+    - "hierarchicalforecast"   # Probabilistic hierarchical forecasting and reconciliation methods.
+    - "utilsforecast"          # Core data wrangling, evaluation, and plotting utilities for the Nixtla ecosystem.
+    - "datasetsforecast"       # Access to standard time series benchmark datasets.
+
+  geospatial_cpu:
+    - "geopandas"              # Extends pandas to allow spatial operations on geometric types (wraps Shapely, Fiona).
+    - "rasterio"               # Reads and writes geospatial raster datasets via GDAL.
+    - "whitebox"               # Advanced geospatial analysis backend containing over 500 parallelized geoprocessing tools.
+    - "leafmap"                # High-level wrapper for interactive mapping and spatial analysis.
+    - "lonboard"               # Extremely fast, interactive vector data visualization leveraging GeoArrow (with potential GPU-acceleration).
+    - "contextily"             # Contextual basemaps for static geographical plots.
+    - "osmnx"                  # Retrieve, construct, analyze, and visualize street networks from OpenStreetMap.
+
+  dl_base_cpu:
+    - "torch"                  # Core PyTorch tensor library (CPU-only build to save space).
+    - "torchvision"            # Datasets, transforms, and models specific to computer vision (CPU-only).
+
+  dl_cv_cpu:
+    - "timm"                   # PyTorch Image Models: massive collection of pre-trained state-of-the-art vision architectures.
+    - "pillow"                 # Python Imaging Library for foundational image processing.
+    - "scikit-image"           # Collection of algorithms for image processing.
+    - "supervision"            # Roboflow's high-level API for handling bounding boxes, polygons, and model evaluation.
+
+  dl_nlp_cpu:
+    - "transformers"           # Hugging Face library providing APIs for state-of-the-art pre-trained NLP models.
+    - "tokenizers"             # Fast state-of-the-art tokenizers optimized for research and production.
+    - "datasets"               # High-performance, Arrow-backed library for loading and processing datasets.
+    - "spacy"                  # Industrial-strength natural language processing and linguistic feature extraction.
+    - "nltk"                   # Classical Natural Language Toolkit for parsing and basic text processing.
+    - "sentence-transformers"  # Framework for generating dense vector embeddings for text, useful for semantic search.
+
+  basic_gpu:
+    - "cuda-toolkit-13-0"      # Base NVIDIA CUDA Toolkit installed directly via PyPI, eliminating OS-level dependency bloat.
+    - "polars[gpu]"            # Enables the cuDF-backed GPU execution engine for Polars queries.
+
+  big_data_gpu:
+    - "cudf-cu13"              # RAPIDS GPU DataFrame library mirroring the Pandas API for tabular data on GPU.
+    - "dask-cudf-cu13"         # Distributed GPU DataFrame computing using Dask and RAPIDS.
+    - "rmm-cu13"               # RAPIDS Memory Manager for highly efficient pool allocation on the GPU.
+
+  ml_gpu:
+    - "scipy"                  # Fundamental algorithms for scientific computing.
+    - "scikit-learn"           # Industry standard machine learning library for classification, regression, and clustering.
+    - "xgboost"                # Optimized distributed gradient boosting library.
+    - "lightgbm"               # Fast, distributed, high-performance gradient boosting framework based on decision tree algorithms.
+    - "catboost"               # Gradient boosting on decision trees with native handling of categorical features.
+    - "optuna"                 # Hyperparameter optimization framework using define-by-run API.
+    - "imbalanced-learn"       # Tools for classification with imbalanced classes (SMOTE, ADASYN).
+    - "umap-learn"             # Uniform Manifold Approximation and Projection for dimensionality reduction.
+    - "shap"                   # SHapley Additive exPlanations for model interpretability and feature importance.
+    - "cuml-cu13"              # RAPIDS library providing Scikit-Learn compatible machine learning algorithms strictly on the GPU.
+    
+  optimization_gpu:
+    - "ortools"                # Google's open-source software suite for optimization (routing, constraint programming).
+    - "gekko"                  # Large-scale non-linear, mixed-integer, and dynamic optimization framework.
+    - "cvxpy"                  # Domain-specific language for modeling and solving convex optimization problems.
+
+  time_series_gpu:
+    - "prophet"                # Meta's procedure for forecasting time series data based on an additive model.
+    - "sktime"                 # Unified framework for machine learning with time series (classification, regression).
+    - "darts"                  # User-friendly library for forecasting and anomaly detection on time series.
+    # --- Nixtla Stack ---
+    - "statsforecast"          # Blazing fast implementation of statistical forecasting models (ARIMA, ETS).
+    - "mlforecast"             # Framework to perform time series forecasting using machine learning models (XGBoost, LightGBM).
+    - "neuralforecast"         # State-of-the-art neural network forecasting architectures (N-BEATS, TFT).
+    - "hierarchicalforecast"   # Probabilistic hierarchical forecasting and reconciliation methods.
+    - "utilsforecast"          # Core data wrangling, evaluation, and plotting utilities for the Nixtla ecosystem.
+    - "datasetsforecast"       # Access to standard time series benchmark datasets.
+
+  geospatial_gpu:
+    - "geopandas"              # Extends pandas to allow spatial operations on geometric types (wraps Shapely, Fiona).
+    - "rasterio"               # Reads and writes geospatial raster datasets via GDAL.
+    - "whitebox"               # Advanced geospatial analysis backend containing over 500 parallelized geoprocessing tools.
+    - "leafmap"                # High-level wrapper for interactive mapping and spatial analysis.
+    - "lonboard"               # Extremely fast, interactive vector data visualization leveraging GeoArrow (with potential GPU-acceleration).
+    - "contextily"             # Contextual basemaps for static geographical plots.
+    - "osmnx"                  # Retrieve, construct, analyze, and visualize street networks from OpenStreetMap.
+
+  dl_base_gpu:
+    - "torch"                  # PyTorch core compiled with CUDA 13 support.
+    - "torchvision"            # Computer vision components compiled with CUDA 13 support.
+
+  dl_cv_gpu:
+    - "timm"                   # PyTorch Image Models.
+    - "pillow"                 # Image processing base.
+    - "scikit-image"           # Scientific image processing.
+    - "supervision"            # Roboflow object detection API.
+    - "nvidia-dali-cuda130"    # NVIDIA Data Loading Library: bypasses CPU bottlenecks by decoding images directly on the GPU.
+    - "kornia"                 # Differentiable computer vision library for tensor-based image augmentations (replaces Albumentations).
+
+  dl_nlp_gpu:
+    - "transformers"           # Hugging Face model API.
+    - "tokenizers"             # Hugging Face tokenization.
+    - "datasets"               # Hugging Face data loaders.
+    - "nltk"                   # Classical Natural Language Toolkit for parsing and basic text processing.
+    - "sentence-transformers"  # Embedding generation.
+    - "spacy[cuda13x]"         # GPU-accelerated NLP parsing and feature extraction.
+    - "accelerate"             # Simplifies writing PyTorch loops for multi-GPU, mixed-precision (FP16/FP8) execution.
+    - "peft"                   # Parameter-Efficient Fine-Tuning library supporting methodologies like LoRA and QLoRA.
+    - "vllm"                   # High-throughput LLM serving engine utilizing PagedAttention for maximum token generation speed.

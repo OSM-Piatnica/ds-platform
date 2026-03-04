@@ -1,0 +1,527 @@
+# config/jupyterhub/jupyterhub_config.py.j2
+
+from dockerspawner import DockerSpawner
+from jupyterhub import orm
+import os
+import asyncio
+import requests
+import pwd
+import shutil
+import docker
+
+c = get_config()
+
+# =============================================================================
+# NETWORK & DATABASE CONFIGURATION
+# =============================================================================
+# Listen on all interfaces within the container.
+c.JupyterHub.hub_ip = "0.0.0.0"
+# The internal hostname accessible for other containers in the Docker network.
+c.JupyterHub.hub_connect_ip = "jupyterhub"
+# Connection string to the PostgreSQL database on the backend network.
+c.JupyterHub.db_url = "postgresql+psycopg://jupyterhub_user:{{ jupyterhub_db_password }}@postgresql:5432/jupyterhub_db"
+
+# Enable "Named Servers" to allow users to have multiple workspaces.
+c.JupyterHub.allow_named_servers = True
+# Redirect users to their home page upon login.
+c.JupyterHub.default_url = "/hub/home"
+
+# Consider:
+#c.JupyterHub.shutdown_on_logout = True
+
+# =============================================================================
+# COOKIE SECURITY
+# =============================================================================
+# Enforce secure cookie attributes for better security behind a proxy.
+# This helps mitigate cross-site scripting (XSS) and cross-site request forgery
+# (CSRF) attacks.
+# =============================================================================
+
+# Define the secure cookie options in one place.
+cookie_options = {
+    "samesite": "Lax",
+    "secure": True,
+    "httponly": True,
+}
+
+# Apply settings to the Hub's own web server.
+c.JupyterHub.tornado_settings = {
+    "cookie_options": cookie_options,
+}
+
+# Pass the same settings to the single-user servers via an environment
+# variable.
+# The jupyterhub-singleuser entrypoint will automatically parse this.
+import json
+c.Spawner.environment = {
+    "JUPYTERHUB_COOKIE_OPTIONS": json.dumps(cookie_options)
+}
+
+# =============================================================================
+# AUTHENTICATOR (OIDC via Authelia)
+# =============================================================================
+from oauthenticator.generic import GenericOAuthenticator
+c.JupyterHub.authenticator_class = GenericOAuthenticator
+
+# Seamless Login: Bypass "OAuth2 Sign In" Screen.
+# If user is logged into Authelia, log them into JupyterHub automatically.
+c.Authenticator.auto_login = True
+
+# OIDC Endpoints (internal communication with Authelia container).
+c.GenericOAuthenticator.oauth_callback_url = "https://jupyter.{{ parent_domain }}/hub/oauth_callback"
+c.GenericOAuthenticator.client_id = "jupyterhub"
+c.GenericOAuthenticator.client_secret = "{{ jupyterhub_oidc_client_secret }}"
+c.GenericOAuthenticator.authorize_url = "https://auth.{{ parent_domain }}/api/oidc/authorization"
+c.GenericOAuthenticator.token_url = "https://auth.{{ parent_domain }}/api/oidc/token"
+c.GenericOAuthenticator.userdata_url = "https://auth.{{ parent_domain }}/api/oidc/userinfo"
+
+# Claims mapping.
+c.GenericOAuthenticator.scope = ["openid", "profile", "email", "groups"]
+c.GenericOAuthenticator.username_claim = "preferred_username"
+
+# Group Management: Sync Authelia groups with JupyterHub groups.
+c.GenericOAuthenticator.manage_groups = True
+c.GenericOAuthenticator.auth_state_groups_key = lambda auth_state: auth_state.get("oauth_user", {}).get("groups",)
+
+# Admin Access: Give the members of `admin` group access to Admin interface.
+c.JupyterHub.admin_access = True
+c.GenericOAuthenticator.admin_groups = {"admins"}
+
+# Global Logout: Redirect to global logout url to integrate with `logout-all.html` script.
+c.GenericOAuthenticator.logout_redirect_url = "https://auth.{{ parent_domain }}/logout-all?rd=https://jupyter.{{ parent_domain }}&origin=jupyter"
+
+# Allow any user who can login to access the Hub.
+c.GenericOAuthenticator.allow_all = True 
+
+{% if use_custom_certs %}
+
+# Manually pass CA certificates only when using custom/internal PKI.
+# (When using Let's Encrypt, the container's standard CA store handles
+# validation).
+c.GenericOAuthenticator.http_request_kwargs = {
+    "ca_certs": "/etc/jupyterhub/certs/internal-ca.pem",
+}
+
+{% endif %}
+
+# Force upstream check of Authelia session.
+c.GenericOAuthenticator.auth_refresh_age = 300 # every 5 minutes
+
+# Read the Crypt Key from the secret file mounted by Docker.
+# (Required for `enable_auth_state` below.)
+with open(os.environ.get("JUPYTERHUB_CRYPT_KEY_FILE", "/run/secrets/jupyterhub_crypt_key"), "r") as f:
+    c.CryptKeeper.keys = [f.read().strip()]
+# Enable the persistence of the `auth_state`.
+# Allows retrieval of user details (e.g., name, email).
+c.GenericOAuthenticator.enable_auth_state = True
+
+# =============================================================================
+# SPAWNER LOGIC (DockerSpawner)
+# =============================================================================
+
+from traitlets import default
+
+# -----------------------------------------------------------------------------
+# Custom Class for Additional Container logic
+# -----------------------------------------------------------------------------
+class ResumableDockerSpawner(DockerSpawner):
+    """
+    A DockerSpawner that:
+    1. Skips the options_form (image choice), if the user's container already
+    exists.
+    2. Deletes orphaned, stopped containers if a server was deleted from the
+    Hub, but the container was left behind.
+    3. Syncs SSH keys to Forgejo after start.
+    """
+
+    # Override the method that generates the default options form.
+    @default("options_form")
+    def _options_form_default(self):
+        # `spawner.container_id` is populated from the database *before* the
+        # form is called. Note that this wouldn't work in `pre_spawn_hook` as
+        # restarting container isn't technically a spawn yet (the spawn occurs
+        # after the image choice).
+        if self.container_id:
+            self.log.info(f"Found existing container {self.container_id}, resuming...")
+            # Return an empty string to show no form.
+            return ""
+        
+        self.log.info("No existing container found, showing image options form.")
+        # Fall back to the default image choice form, by calling the
+        # form-building method from the parent class.
+        return self._default_options_form()
+
+    # Automatic SSH Key Sync to Forgejo.
+    async def sync_ssh_key(self):
+        """
+        Custom function to sync SSH key to Forgejo after container starts.
+        Defined as a method so it has access to `self.user`, `self.log`, etc.
+        """
+
+        username = self.user.name
+        self.log.info(f"Attempting to sync SSH key for user: {username}")
+
+        try:
+            # ---------------------------------------------------------------------
+            # STEP 1: READ KEY FROM USER CONTAINER
+            # ---------------------------------------------------------------------
+            public_key = None
+            
+            # Retry loop: Wait up to 20 seconds for `entrypoint.sh` to generate the key.
+            for i in range(10):
+                try:
+                    # Use `asyncio.to_thread` to prevent blocking the event loop.
+                    # `exec_create` prepares the command.
+                    exec_create_resp = await asyncio.to_thread(
+                        self.client.exec_create,
+                        container=self.container_id,
+                        cmd=["cat", "/home/jovyan/.ssh/id_ed25519.pub"],
+                        stdout=True
+                    )
+                    exec_id = exec_create_resp['Id']
+
+                    # `exec_start` runs the command and returns the output.
+                    output = await asyncio.to_thread(
+                        self.client.exec_start,
+                        exec_id=exec_id
+                    )
+
+                    # Decode output safely.
+                    decoded_key = output.decode('utf-8').strip() if isinstance(output, bytes) else str(output).strip()
+
+                    if "ssh-ed25519" in decoded_key:
+                        public_key = decoded_key
+                        break
+
+                except Exception as e:
+                    self.log.debug(f"SSH key not ready yet (attempt {i+1}): {e}")
+
+                # Non-blocking sleep.
+                await asyncio.sleep(2)
+
+            if not public_key:
+                self.log.warning(f"Timed out waiting for SSH key generation for {username}")
+                return
+
+            # ---------------------------------------------------------------------
+            # STEP 2: PUSH KEY TO FORGEJO VIA API
+            # ---------------------------------------------------------------------
+            
+            # Retrieve Admin Credentials.
+            admin_user = os.environ.get("INFRA_ADMIN_USERNAME")
+            admin_pass_file = os.environ.get("INFRA_ADMIN_PASSWORD_FILE")
+
+            if not admin_user or not admin_pass_file:
+                self.log.error("Forgejo admin credentials not found in env. Skipping key sync.")
+                return
+
+            # Read password from secret file.
+            with open(admin_pass_file, 'r') as f:
+                admin_pass = f.read().strip()
+
+            # Forgejo Internal API URL.
+            api_url = f"http://forgejo:3000/api/v1/admin/users/{username}/keys"
+
+            payload = {
+                "key": public_key,
+                "title": "jupyterhub-auto-key",
+                "read_only": False
+            }
+
+            # Perform the API request in a thread (requests is blocking).
+            response = await asyncio.to_thread(
+                requests.post,
+                api_url,
+                json=payload,
+                auth=(admin_user, admin_pass),
+                timeout=5
+            )
+
+            if response.status_code == 201:
+                self.log.info(f"Successfully synced SSH key for {username} to Forgejo.")
+            elif response.status_code == 422:
+                self.log.info(f"SSH key for {username} already exists in Forgejo.")
+            else:
+                self.log.error(f"Failed to sync SSH key. Status: {response.status_code}, Body: {response.text}")
+
+        except Exception as e:
+            # Catch-all to ensure server start doesn't fail if sync fails.
+            self.log.error(f"Failed to auto-sync SSH key: {e}")
+
+
+    async def start(self):
+        """
+        Override the start method to:
+        1. Perform orphaned container pre-check.
+        If `self.container_id` is not set (i.e., the Hub thinks this is a new
+        server), but a container with `self.container_name` does exist, delete
+        it.
+
+        2. Start the container.
+
+        3. Trigger *post-spawn* key sync.
+        """
+
+        # ---------------------------------------------------------------------
+        # STEP 1: ORPHAN CHECK
+        # ---------------------------------------------------------------------
+
+        # Check for the "orphaned" state: no ID in the database.
+        if not self.container_id:
+            self.log.info(f"No `container_id` in database for {self.user.name}:{self.name}.")
+
+            # Check if a container with this name does exist on the host.
+            try:
+                container = await self.docker("inspect_container", self.container_name)
+                if container:
+                    self.log.warning(f"Found orphaned container {container['Id']} for {self.user.name}:{self.name}. Server was likely deleted from the Hub. Removing...")
+                    try:
+                        await self.docker("remove_container", self.container_name, force=True)
+                    except docker.errors.APIError as e:
+                        self.log.error(f"Failed to remove orphaned container: {e}")
+
+            except docker.errors.NotFound:
+                # This is the normal, "clean start" case.
+                self.log.info(f"No container named {self.container_name} found. Proceeding with normal spawn.")
+
+            except Exception as e:
+                self.log.error(f"Error during orphaned container check: {e}")
+
+        # ---------------------------------------------------------------------
+        # STEP 2: START THE CONTAINER
+        # ---------------------------------------------------------------------
+        # This returns (ip, port) tuple needed by the Hub.
+        ip_port = await super().start()
+
+        # ---------------------------------------------------------------------
+        # STEP 3: TRIGGER SSH SYNC
+        # ---------------------------------------------------------------------
+        # Run this *after* the container is running so we can `exec` into it.
+        # Use `create_task` so we don't block the user's login redirect.
+        asyncio.create_task(self.sync_ssh_key())
+
+        return ip_port
+
+c.JupyterHub.spawner_class = ResumableDockerSpawner
+
+# -----------------------------------------------------------------------------
+# General Spawner configuration
+# -----------------------------------------------------------------------------
+
+# Network: Spawn containers on the frontend network, so Caddy can reach them.
+c.ResumableDockerSpawner.network_name = "ds-frontend-net"
+c.ResumableDockerSpawner.use_internal_hostname = True
+
+# Image Selection
+# `jupyter_images` is dict --- we access its values.
+# Check if GPU variants of images are available.
+c.ResumableDockerSpawner.allowed_images = {
+{% for img in jupyter_images.values() %}
+{% if '-gpu' not in img.name or ('-gpu' in img.name and host_has_gpu) %}
+    "{{ img.display_name }}": "git.{{ parent_domain }}/{{ infra_admin_username }}/{{ img.name }}:latest",
+{% endif %}
+{% endfor %}
+}
+
+# Add labels to the spawned containers.
+# These labels are essential for management scripts,
+# like the pruning script, to identify Hub-managed containers.
+c.ResumableDockerSpawner.extra_create_kwargs = {
+    "labels": {
+        "jupyterhub.managed-by": "jupyterhub",
+        "jupyterhub.user": "{username}",
+        "jupyterhub.service.name": "{servername}"
+    }
+}
+
+# Deep Learning libraries (e.g., PyTorch) use shared memory for DataLoader workers. 
+# The default Docker `shm_size` is 64MB, which might cause 
+# "DataLoader worker (pid X) is killed by signal: Bus error".
+# Fix: change `shm_size` to higher value.
+c.ResumableDockerSpawner.extra_host_config = {
+    "shm_size": "2g" # Or higher, based on the host RAM
+}
+
+
+# -----------------------------------------------------------------------------
+# Resource Limits & Reservations
+# -----------------------------------------------------------------------------
+
+# Limits: 
+# Hard cap on usage. 
+# The container will be throttled (CPU) or killed (RAM) if exceeded.
+c.ResumableDockerSpawner.cpu_limit = 4.0
+c.ResumableDockerSpawner.mem_limit = "16G"
+
+# Reservations: 
+# The scheduler will only schedule the container if this much is free.
+c.ResumableDockerSpawner.cpu_guarantee = 1.0
+c.ResumableDockerSpawner.mem_guarantee = "4G"
+
+# -----------------------------------------------------------------------------
+# Volumes and Mounts
+#
+# The service mounts the user data directory. The Spawner then tells the Docker
+# daemon to mount a *subdirectory* of that for each user.
+# -----------------------------------------------------------------------------
+
+# Get the host path of the config directory, passed in from
+# `docker-compose.yml`
+host_config_path = os.environ.get("HUB_HOST_CONFIG_PATH")
+
+# The path for user data on the host machine.
+host_user_data_path = "/srv/jupyterhub_data/users"
+
+# The username on the host machine.
+host_username = pwd.getpwuid(os.getuid()).pw_name
+
+c.ResumableDockerSpawner.volumes = {
+    # Mount the user's persistent home directory from the host.
+    # For example: /srv/jupyterhub_data/users/{{ infra_admin_username }} -> /home/jovyan
+    os.path.join(host_user_data_path, "{username}"): "/home/jovyan",
+
+    # Mount metadata and scripts from the host into the spawn container.
+    # This gives the `entrypoint.sh` script access to the necessary files.
+    # For example: /home/{{ infra_admin_username }}/{{ project_root }}/config/jupyterhub/image-meta 
+    #              -> /etc/jupyterhub/image-meta
+    os.path.join(host_config_path, "image-meta"): {"bind": "/etc/jupyterhub/image-meta/", "mode": "ro"},
+    os.path.join(host_config_path, "scripts"): {"bind": "/etc/jupyterhub/scripts/", "mode": "ro"},
+}
+
+# -----------------------------------------------------------------------------
+# RTC Setup
+# -----------------------------------------------------------------------------
+
+# Collaborative account name.
+collab_acc_name = "collab-project"
+
+# Group for users having control over collaborative accounts.
+member_group = "rtc-users"
+
+# Group for collaborative accounts.
+collab_service_group = "collaborative-accounts"
+
+# Define and load roles.
+c.JupyterHub.load_roles = [
+    {
+        "name": f"access-{collab_acc_name}",
+        "description": f"Access to the {collab_acc_name} server",
+        "scopes": [
+            # Allows starting/stopping the shared server.
+            f"admin:servers!user={collab_acc_name}",
+            # Allows accessing the shared server.
+            f"access:servers!user={collab_acc_name}",
+            # Allows member to see the admin UI.
+            "admin-ui",
+            # Allows members to see only themselves and the collab account.
+            "list:users!user",
+            f"list:users!user={collab_acc_name}",
+        ],
+        # Grant this role to the member group
+        "groups": [member_group]
+    }
+]
+
+# -----------------------------------------------------------------------------
+# Prepare information for Hooks
+# -----------------------------------------------------------------------------
+
+# Extract the spawned image name into `spawner.image` variable.
+def apply_user_options(spawner, user_options):
+    if "image" in user_options and isinstance(user_options["image"], str):
+        spawner.image = c.ResumableDockerSpawner.allowed_images[user_options["image"]]
+
+c.Spawner.apply_user_options = apply_user_options
+
+# Get the project name.
+def get_project_name(spawner):
+    if spawner.name:
+        return spawner.name
+    else:
+        # If the user is starting their default server, `spawner.name` is
+        # empty. (`entrypoint.sh` doesn't allow unnamed projects.)
+        return "default-project"
+
+# -----------------------------------------------------------------------------
+# Pre-Spawn Hook
+# -----------------------------------------------------------------------------
+async def pre_spawn_hook(spawner):
+    """
+    This hook only sets environment variables for the container and defines the
+    user's starting directory. All file system operations are delegated to the
+    container's entrypoint script for better isolation and stability.
+    """
+
+    # -------------------------------------------------------------------------
+    # Pass necessary information to the container's entrypoint script.
+    # -------------------------------------------------------------------------
+  
+    # Image name:
+    spawner.environment["JUPYTER_IMAGE_SPEC"] = spawner.image
+
+    # Project name:
+    project_name = get_project_name(spawner)
+    spawner.environment["JUPYTER_PROJECT_NAME"] = project_name
+
+    # User Group membership:
+    groups = [group.name for group in spawner.user.groups]
+
+    spawner.log.info(f"DEBUG: User {spawner.user.name} groups: {groups}")
+
+    # -------------------------------------------------------------------------
+    # Git Identity Automation
+    # -------------------------------------------------------------------------
+
+    # Retrieve user info from Authelia (OIDC).
+    auth_state = await spawner.user.get_auth_state()
+    user_info = auth_state.get('oauth_user', {})
+
+    # Determine Name and Email.
+    # Fallback to JupyterHub username if OIDC name is missing.
+    git_name = user_info.get('name', spawner.user.name) 
+    # Fallback to placeholder email if OIDC email is missing.
+    git_email = user_info.get('email', f"{spawner.user.name}_placeholder@{{ parent_domain }}")
+
+    spawner.log.info(f"Auto-configuring Git identity for {spawner.user.name}: {git_name} <{git_email}>")
+
+    # Inject Environment Variables (Git detects these automatically)
+    spawner.environment["GIT_AUTHOR_NAME"] = git_name
+    spawner.environment["GIT_AUTHOR_EMAIL"] = git_email
+    spawner.environment["GIT_COMMITTER_NAME"] = git_name
+    spawner.environment["GIT_COMMITTER_EMAIL"] = git_email
+
+    # -------------------------------------------------------------------------
+    # Collaborative Account Configuration
+    # -------------------------------------------------------------------------
+
+    # Check if the user spawning server is a collaborative account
+    is_collab_server = collab_service_group in groups
+
+    if is_collab_server:
+        spawner.log.info(f"Spawning '{project_name}' as a collaborative server")
+        # Here, collab-specific configuration can be added.
+        # e.g. `spawner.cpu_limit = 4.0`
+    
+    # -------------------------------------------------------------------------
+    # GPU Image Management
+    # -------------------------------------------------------------------------
+    
+    # Dynamically allocate GPUs if the chosen image is a GPU variant
+    if "-gpu" in spawner.image:
+        spawner.log.info(f"GPU image detected. Allocating GPUs for {project_name}.")
+        
+        # Create a new dict to prevent mutating a shared Traitlet configuration.
+        new_host_config = dict(spawner.extra_host_config)
+        new_host_config["device_requests"] = [
+            # Note that `count=-1` tells the Docker daemon to pass all available GPUs on the host to the spawned container.
+            docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+        ]
+        spawner.extra_host_config = new_host_config
+
+    # -------------------------------------------------------------------------
+
+    # Set the user's starting directory to their project directory within the
+    # container.
+    spawner.notebook_dir = f"/home/jovyan/{project_name}"
+
+c.Spawner.pre_spawn_hook = pre_spawn_hook

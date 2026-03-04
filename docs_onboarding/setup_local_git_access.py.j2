@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+
+"""
+setup_local_git_access.py
+
+Automate the configuration of a developer's local machine to 
+interact with the Platform's Git service (Forgejo).
+
+Tasks performed:
+    1. Generate a secure SSH key (ed25519) if one does not exist.
+    2. Configure the local SSH client to use a non-standard port (222) for the
+    platform.
+    3. Open the Forgejo web interface for the user to register their new key.
+"""
+
+import os
+import sys
+import subprocess
+import platform
+
+DOMAIN= "git.{{ parent_domain }}"
+PORT = "222"
+# The Git user is always "git" for Forgejo instances.
+USER = "git"
+# Use ed25519 keys as the are mroe secure and performant than RSA.
+KEY_NAME = "id_ed25519"
+
+def get_ssh_dir():
+    """Return the platform-specific path to the user's `.ssh` directory."""
+    return os.path.expanduser("~/.ssh")
+
+def get_key_path():
+    """Return the full path to the intended private key file."""
+    return os.path.join(get_ssh_dir(), KEY_NAME)
+
+def get_config_path():
+    """Return the path to the user's SSH config file."""
+    return os.path.join(get_ssh_dir(), "config")
+
+def generate_key_if_missing():
+    """Generate a new ed25519 SSH key pair if the private key doesn't exist."""
+    key_path = get_key_path()
+
+    # Idempotency check: Don't overwrite an existing key.
+    if os.path.exists(key_path):
+        print(f"[+] SSH key already exists at: {key_path}")
+        return
+
+    print(f"[*] Generating new SSH key ({KEY_NAME})...")
+    ssh_dir = get_ssh_dir()
+
+    # Ensure `~/.ssh` exists with secure permissions (0700).
+    if not os.path.exists(ssh_dir):
+        os.makedirs(ssh_dir, mode=0o700)
+
+    try:
+        # Run `ssh-keygen` non-interactively (-N "" sets an empty passphrase).
+        # Use `shell=True` on Windows to resolve the path correctly.
+        cmd = f'ssh-keygen -t ed25519 -N "" -f "{key_path}"'
+        if platform.system() == "Windows":
+            subprocess.run(cmd, shell=True, check=True)
+        else:
+            subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path], check=True)
+        print("[+] Key generated successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"[-] FATAL: Failed to generate key: {e}")
+        sys.exist(1)
+
+def update_ssh_config():
+    """
+    Append a Host block to ~/.ssh/config.
+
+    This is critical because the Forgejo runs on Port 222, but standard git
+    commands default to Port 22.
+    This config allows users to simply type the domain, and SSH handles the
+    port.
+    """
+    config_path = get_config_path()
+
+    # The SSH config block.
+    # `PreferredAuthentications publickey` forces the client to offer the key
+    # instead of falling back to password auth (which Forgejo disables).
+    config_block = f"""
+Host {DOMAIN}
+    HostName {DOMAIN}
+    User {USER}
+    Port {PORT}
+    PreferredAuthentications publickey
+    IdentityFile {get_key_path()}
+"""
+
+    current_content = ""
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            current_content = f.read()
+
+    # Idempotency check: Don't duplicate the block if it exists.
+    if f"Host {DOMAIN}" in current_content:
+        print(f"[+] SSH config at ~/.ssh/config for {DOMAIN} already exists. Skipping.")
+    else:
+        print(f"[*] Configuring ~/.ssh/config for custom port usage...")
+        with open(config_path, 'a') as f:
+            # Ensure we start on a new line if the file doesn't end with one.
+            if current_content and not current_content.endswith("\n"):
+                f.write("\n")
+            f.write(config_block)
+        print(f"[+] Added host entry for {DOMAIN} (Port {PORT}).")
+
+def instruct_user():
+    """
+    Read the newly generated public key and prompt the user to follow the
+    instructions.
+    """
+    pub_key_path = f"{get_key_path()}.pub"
+
+    try:
+        with open(pub_key_path, 'r') as f:
+            pub_key = f.read().strip()
+    except FileNotFoundError:
+        print("[-] FATAL: Public key not found!")
+        return
+
+    print("\n" + '='*60)
+    print("ACTION REQUIRED: COPY THE KEY BELOW")
+    print('='*60)
+    print(pub_key)
+    print('='*60 + "\n")
+
+    url = f"https://{DOMAIN}/user/settings/keys"
+    print(f"[*] Please perform the below actions:\n    1. Open the following URL in your browser: {url}\n    2. Click 'Add key' in the 'Manage SSH keys' window,\n    3. Paste the key into the 'Content' field,\n    4. Click 'Add Key' below the field.")
+
+def main():
+    print("--- DS Platform Git Local Setup ---\n")
+    generate_key_if_missing()
+    update_ssh_config()
+    instruct_user()
+
+    print("\n[+] That's it!")
+    print(f"    Once this setup is completed, you can clone/push to repos using straighforward git commands.\n    For example: git clone git@{DOMAIN}:user_name/repo_name.git")
+
+if __name__ == "__main__":
+    main()

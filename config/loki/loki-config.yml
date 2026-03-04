@@ -1,0 +1,84 @@
+# config/loki/loki-config.yml
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  #grpc_listen_port: 9096 # Unused in monolithic mode
+  log_level: info
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    instance_addr: 127.0.0.1 # Force local registration for single-node.
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: "2025-10-29"
+      store: tsdb
+      object_store: filesystem
+        #object_store: s3
+      schema: v13
+      index:
+        period: 24h
+        prefix: index_
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/tsdb-index
+    cache_location: /loki/tsdb-cache
+    cache_ttl: 24h
+
+# Improved Performance: Bloom Filters for Data Science Logs
+pattern_ingester:
+  enabled: true
+
+# Required for retention to work.
+compactor:
+  working_directory: /loki/compactor
+
+  compactor_ring:
+    kvstore:
+      store: inmemory
+
+  # Enable the retention policy.
+  retention_enabled: true
+
+  # How long to wait before deleting logs marked for deletion.
+  retention_delete_delay: 2h
+
+  retention_delete_worker_count: 150
+
+  delete_request_store: filesystem
+
+limits_config:
+  # Set the global retention period for all logs.
+  # Adjust as needed.
+  retention_period: 30d
+
+  max_cache_freshness_per_query: 10m
+  split_queries_by_interval: 15m
+  
+  # Allow larger queries for notebook outputs.
+  max_line_size: 1MB
+  #max_query_length: 721h
+  max_entries_limit_per_query: 10000
+  unordered_writes: true # Option for high-concurrency loggers.
+
+# Disable legacy Table Manager
+table_manager:
+  retention_deletes_enabled: false
+  retention_period: 0s
+
+# Flush chunks to storage upon shutdown to minimize the size of the WAL,
+# thus speeding up subsequent restarts.
+ingester:
+  wal:
+    flush_on_shutdown: true

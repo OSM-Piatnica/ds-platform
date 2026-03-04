@@ -1,0 +1,488 @@
+// config/alloy/config.alloy
+
+// ============================================================================
+// LOGS PIPELINE
+// ============================================================================
+
+// --- 1. Log Discovery ---
+
+// Discover all running containers on the Docker host,
+// by connecting to the Docker daemon API via the host-mounted socket.
+discovery.docker "all_containers" {
+    host = "unix:///var/run/docker.sock"
+}
+
+// Relabel Docker targets to clean up container names
+discovery.relabel "logs_integrations_docker" {
+    targets = discovery.docker.all_containers.targets
+
+    // Rule to extract the container name without the leading '/'
+    // and assign it to a new "container" label.
+    rule {
+        source_labels = ["__meta_docker_container_name"]
+        regex = "/(.*)"
+        target_label = "container"
+    }
+}
+
+// --- 2. Log Collection ---
+
+// Configure Alloy's self-logging.
+logging {
+    level = "info"
+    //level = "warn"
+    format = "logfmt"
+
+    write_to = [loki.process.noise_filter.receiver]
+}
+
+// Collect logs from the discovered containers.
+loki.source.docker "default" {
+    host = "unix:///var/run/docker.sock"
+    targets = discovery.relabel.logs_integrations_docker.output
+    labels = {"job" = "docker"}
+
+    // Apply the relabeling rules.
+    relabel_rules = discovery.relabel.logs_integrations_docker.rules
+
+    // Forward all collected logs to the noise filter.
+    forward_to = [loki.process.noise_filter.receiver]
+}
+
+
+// Collect logs from the Journald host logs.
+loki.source.journal "host" {
+    path = "/var/log/journal"
+
+    // Only read the last 12 hours on startup to prevent flooding.
+    max_age = "12h" 
+
+    // Filter for Docker daemon logs.
+    //matches = "_SYSTEMD_UNIT=docker.service"
+
+    // Apply the relabeling rules.
+    //relabel_rules = discovery.relabel.logs_integrations_docker.rules
+
+    // Add a job label for easy querying.
+    labels = {"job" = "journald", component = "host_logs"}
+
+    // Forward logs to the noise filter.
+    forward_to = [loki.process.noise_filter.receiver]
+}
+
+// --- 3. Log Filtering ---
+loki.process "noise_filter" {
+
+    // Drop Loki feedback loop noise.
+    //stage.match {
+    //    selector = "{container=\"loki\"}"
+
+    //    // Drop high volume query logs.
+    //    stage.drop {
+    //        expression = ".*caller=(metrics|table_manager|index_set|shipper|checkpoint|roundtrip|compactor|recalculate_owned_streams|table)\\.go.*"
+    //    }
+    //    stage.drop {
+    //        expression = ".*component=(querier|frontend|ingester).*"
+    //    }
+    //}
+
+    // Authelia Schema Checks (Repetitive Startup Noise)
+    // Log pattern: Storage schema is being checked... / already up to date
+    stage.drop {
+        expression = ".*Storage schema is (being checked|already).*"
+    }
+
+    // Forgejo Artifact Cleanup (Routine Maintenance Noise)
+    // Log pattern: Start to cleanup dangling images...
+    stage.drop {
+        expression = ".*CleanupSHA256.*"
+    }
+
+    // --- Remove Redundant/Duplicated Timestamps ---
+
+    // Alloy, Loki, Prometheus, Grafana, Authelia.
+    stage.replace {
+        expression = "(\\b(ts|time|t)=\"?\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z?\"?\\s?)"
+        replace = ""
+    }
+
+    // Forgejo.
+    stage.match {
+        selector = "{container=\"forgejo\"}"
+
+        stage.replace {
+            //expression = "(\\b\\d{4}/\\d{2}/\\d{2} \\d{2}:\\d{2}:\\d{2}\\s+)"
+            expression = "(\\b\\d{4}/\\d{2}/\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}\\s+)"
+            replace = ""
+        }
+    }
+
+    // PostgreSQL.
+    stage.match {
+        selector = "{container=\"postgresql\"}"
+
+        stage.replace {
+            //expression = "(\\b\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(\\.\\d+)? UTC\\s+)"
+            expression = "(\\b\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}\\.\\d+\\s+UTC\\s+)"
+            replace = ""
+        }
+    }
+
+    // JupyterHub.
+    stage.match {
+        selector = "{container=\"jupyterhub\"}"
+
+        stage.replace {
+            //expression = "(\\b\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d)+Z\\s+)"
+            expression = "(\\b\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d+Z\\s+)"
+            replace = ""
+        }
+
+        stage.replace {
+            expression = "(\\b\\s\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?)"
+            replace = ""
+        }
+    }
+
+    // Valkey.
+    stage.match {
+        selector = "{container=\"valkey\"}"
+
+        stage.replace {
+            //expression = "(\\b\\s\\d{2} [A-Z][a-z]{2} \\d{4} \\d{2}:\\d{2}:\\d{2}(\\.\\d+)? [\\*#-])"
+            expression = "(\\b(\\d+:[A-Z]\\s+)\\d{2}\\s+\\w{3}\\s+\\d{4}\\s+\\d{2}:\\d{2}:\\d{2}\\.\\d+)"
+            replace = ""
+        }
+    }
+
+    //// --- Structure Logfmt Logs ---
+    //// Loki
+    //stage.match {
+    //    selector = "{container=\"loki\"}"
+    //    stage.logfmt {
+    //        mapping = {
+    //            ts = "ts",
+    //            level = "level",
+    //            component = "component",
+    //            caller = "caller",
+    //            msg = "msg",
+    //        }
+    //    }
+
+    //    // Set the label for level, enabling easy filtering by error.
+    //    stage.labels {
+    //        values = {
+    //            level = "level",
+    //            component = "component",
+    //        }
+    //    }
+
+    //    // Standardize timestamp
+    //    stage.timestamp {
+    //        source = "ts"
+    //        format = "RFC3339"
+    //    }
+
+    //    // Clean up the log line to just be the message.
+    //    stage.output {
+    //        source = "msg"
+    //    }
+    //}
+
+    //// Prometheus
+    //stage.match {
+    //    selector = "{container=\"prometheus\"}"
+    //    stage.logfmt {
+    //        mapping = {
+    //            ts = "time",
+    //            level = "level",
+    //            component = "component",
+    //            caller = "caller",
+    //            msg = "msg",
+    //        }
+    //    }
+
+    //    // Set the label for level, enabling easy filtering by error.
+    //    stage.labels {
+    //        values = {
+    //            level = "level",
+    //            component = "component",
+    //        }
+    //    }
+
+    //    // Standardize timestamp
+    //    stage.timestamp {
+    //        source = "ts"
+    //        format = "RFC3339"
+    //    }
+
+    //    // Clean up the log line to just be the message.
+    //    stage.output {
+    //        source = "msg"
+    //    }
+    //}
+
+    //// Alloy
+    //stage.match {
+    //    selector = "{container=\"alloy\"}"
+    //    stage.logfmt {
+    //        mapping = {
+    //            ts = "ts",
+    //            level = "level",
+    //            component = "component",
+    //            caller = "caller",
+    //            msg = "msg",
+    //        }
+    //    }
+
+    //    // Set the label for level, enabling easy filtering by error.
+    //    stage.labels {
+    //        values = {
+    //            level = "level",
+    //            component = "component",
+    //        }
+    //    }
+
+    //    // Standardize timestamp
+    //    stage.timestamp {
+    //        source = "ts"
+    //        format = "RFC3339"
+    //    }
+
+    //    // Clean up the log line to just be the message.
+    //    stage.output {
+    //        source = "msg"
+    //    }
+    //}
+
+
+    //// Grafana
+    //stage.match {
+    //    selector = "{container=\"grafana\"}"
+    //    stage.logfmt {
+    //        mapping = {
+    //            ts = "t",
+    //            level = "level",
+    //            component = "component",
+    //            caller = "caller",
+    //            msg = "msg",
+    //        }
+    //    }
+
+    //    // Set the label for level, enabling easy filtering by error.
+    //    stage.labels {
+    //        values = {
+    //            level = "level",
+    //            component = "component",
+    //        }
+    //    }
+
+    //    // Standardize timestamp
+    //    stage.timestamp {
+    //        source = "ts"
+    //        format = "RFC3339"
+    //    }
+
+    //    // Clean up the log line to just be the message.
+    //    stage.output {
+    //        source = "msg"
+    //    }
+    //}
+
+    //// Authelia
+    //stage.match {
+    //    selector = "{container=\"grafana\"}"
+    //    stage.logfmt {
+    //        mapping = {
+    //            ts = "time",
+    //            level = "level",
+    //            component = "component",
+    //            caller = "caller",
+    //            msg = "msg",
+    //        }
+    //    }
+
+    //    // Set the label for level, enabling easy filtering by error.
+    //    stage.labels {
+    //        values = {
+    //            level = "level",
+    //            component = "component",
+    //        }
+    //    }
+
+    //    // Standardize timestamp
+    //    stage.timestamp {
+    //        source = "ts"
+    //        format = "RFC3339"
+    //    }
+
+    //    // Clean up the log line to just be the message.
+    //    stage.output {
+    //        source = "msg"
+    //    }
+    //}
+
+    //// --- Structure JSON Logs ---
+
+    //// Caddy
+    //stage.match {
+    //    selector = "{container=~\"caddy\"}"
+    //    stage.json {
+    //        expressions = {
+    //            ts = "ts",
+    //            level = "level",
+    //            component = "component",
+    //            caller = "caller",
+    //            msg = "msg",
+    //        }
+    //    }
+    //    // Standardize timestamp
+    //    stage.timestamp {
+    //        source = "ts"
+    //        format = "RFC3339"
+    //    }
+    //    // Set the label for level, enabling easy filtering by error.
+    //    stage.labels {
+    //        values = {
+    //            level = "level",
+    //        }
+    //    }
+
+    //    // Clean up the log line to just be the message.
+    //    stage.output {
+    //        source = "msg"
+    //    }
+    //}
+
+    forward_to = [loki.write.default.receiver]
+}
+
+
+
+// --- 4. Log Sink ---
+
+// Define the destination for all logs 
+// (from `logging`, `loki.source.docker`, `loki.source.journal`).
+loki.write "default" {
+    endpoint {
+        // Loki is an admin-only service, bound to
+        // localhost, accessible via SSH tunnel.
+        url = "http://loki:3100/loki/api/v1/push"
+    }
+}
+
+// ============================================================================
+// METRICS PIPELINE
+// ============================================================================
+
+
+// --- 1. Metric Exporters ---
+
+// Expose Alloy's own metrics (meta-monitoring).
+prometheus.exporter.self "default" {}
+
+// Enable the built-in cAdvisor exporter.
+// This provides detailed per-container metrics.
+prometheus.exporter.cadvisor "default" {
+    docker_host = "unix:///var/run/docker.sock"
+
+    //storage_duration = "5m"
+}
+
+// Enable the built-in Node Exporter.
+// This provides detailed host-level system metrics.
+prometheus.exporter.unix "default" {
+    udev_data_path = "/run/udev/data"
+    rootfs_path = "/rootfs"
+    sysfs_path = "/sys"
+    procfs_path = "/rootproc"
+
+    // Enable systemd collector (requires dbus mount).
+    enable_collectors = ["systemd"]
+
+    // Filter out Docker's virtual filesystems to prevent metric explosion.
+    // We exclude overlays, tmpfs, and specific Docker mounts.
+    filesystem {
+        fs_types_exclude = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$"
+        mount_points_exclude = "^/(dev|proc|run/credentials/.+|sys|var/lib/docker/.+)($|/)"
+    }
+
+    // Filter out Docker's virtual network interfaces.
+    // (We generally only care about the physical host interfaces --- eth0, wlan0,
+    // ens*).
+    netdev {
+        device_exclude = "^(veth.*|docker.*|br-.*|lo)$"
+    }
+}
+
+// --- 2. Metric Scrapers ---
+
+// Scrape Alloy's internal metrics exposed by `prometheus.exporter.self`.
+prometheus.scrape "alloy_self" {
+    targets = prometheus.exporter.self.default.targets
+    forward_to = [prometheus.remote_write.default.receiver]
+    scrape_interval = "15s"
+}
+
+// Scrape cAdvisor metrics (built-in exporter), 
+// exposed by `prometheus.exporter.cadvisor`.
+prometheus.scrape "cadvisor" {
+    targets    = prometheus.exporter.cadvisor.default.targets
+    forward_to = [prometheus.remote_write.default.receiver]
+    scrape_interval = "15s"
+}
+
+// Scrape Node Exporter metrics (built-in exporter).
+prometheus.scrape "node_exporter" {
+    targets    = prometheus.exporter.unix.default.targets
+    scrape_interval = "15s"
+    forward_to = [prometheus.remote_write.default.receiver]
+}
+
+// Scrape Docker Daemon's own metrics.
+// This scrapes the /metrics endpoint enabled in `daemon.json`.
+//prometheus.scrape "docker_daemon" {
+//    //targets = [{"__address__" = "127.0.0.1:9323"}]
+//    targets = [{"__address__" = "host.docker.internal:9323"}]
+//    forward_to = [prometheus.remote_write.default.receiver]
+//    scrape_interval = "15s"
+//    job_name = "docker_daemon"
+//}
+
+// --- 3. Metric Sink ---
+
+// Define the destination for all scraped metrics (the Prometheus container).
+prometheus.remote_write "default" {
+    endpoint {
+        // Prometheus is an admin-only service, bound to
+        // localhost, accessible via SSH tunnel.
+        url = "http://prometheus:9090/api/v1/write"
+    }
+}
+
+// ============================================================================
+// BACKUP LOGS PIPELINE
+// ============================================================================
+
+// 1. Discovery: Read the backup log file.
+local.file_match "backup_logs" {
+    path_targets = [{"__path__" = "/rootfs/var/log/backup.log"}]
+    sync_period = "1m"
+}
+
+// 2. Collection: Ingest the logs.
+loki.source.file "backup_logs_scrape" {
+    targets    = local.file_match.backup_logs.targets
+    forward_to = [loki.process.add_backup_label.receiver]
+}
+
+// 3. Processing: Label them for easy querying.
+loki.process "add_backup_label" {
+    stage.static_labels {
+        values = {
+            job = "backup_job",
+            component = "restic",
+        }
+    }
+    forward_to = [loki.write.default.receiver]
+}

@@ -1,0 +1,62 @@
+# config/forgejo/app.ini.j2
+
+[DEFAULT]
+APP_NAME = Forgejo
+RUN_MODE = prod
+RUN_USER = git
+
+[server]
+ROOT_URL = https://git.{{ parent_domain }}/
+SSH_DOMAIN = git.{{ parent_domain }}
+SSH_PORT = 222
+
+[database]
+DB_TYPE = postgres
+HOST = postgresql:5432
+NAME = forgejo_db
+USER = forgejo_user
+PASSWD = """{{ forgejo_db_password }}"""
+
+[repository]
+ENABLE_PUSH_CREATE_USER = true
+ROOT = /data/git/repositories
+
+[mailer]
+ENABLED = true
+PROTOCOL = smtp+starttls
+SMTP_ADDR = {{ smtp_host }}
+FROM = {{ smtp_sender }}
+USER = {{ smtp_username }}
+PASSWD = """{{ smtp_password }}"""
+SMTP_PORT = {{ smtp_port }}
+
+[service]
+DISABLE_REGISTRATION = false
+ALLOW_ONLY_EXTERNAL_REGISTRATION = true
+SHOW_REGISTRATION_BUTTON = false
+ENABLE_INTERNAL_SIGNIN = false
+ENABLE_NOTIFY_MAIL = true
+
+[openid]
+ENABLE_OPENID_SIGNIN = false
+ENABLE_OPENID_SIGNUP = true
+WHITELISTED_URIS = auth.{{ parent_domain }}
+
+[oauth2_client]
+ENABLE_AUTO_REGISTRATION = true
+ACCOUNT_LINKING: auto
+
+[security]
+INSTALL_LOCK = true
+INTERNAL_TOKEN = "{{ forgejo_internal_token }}"
+SECRET_KEY = "{{ forgejo_secret_key }}"
+
+[cors]
+ENABLED = true
+ALLOW_DOMAIN = https://auth.{{ parent_domain }}
+ALLOW_CREDENTIALS = true
+HEADERS = Content-Type, X-Requested-With
+METHODS = POST, OPTIONS
+
+[session]
+SESSION_LIFE_TIME = 3600

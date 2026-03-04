@@ -1,0 +1,112 @@
+# ansible/aux_tasks/build_push_img.yml
+
+- name: "DEBUG | Show previously rebuilt images"
+  ansible.builtin.debug:
+    var: rebuilt_images
+
+- name: "CONFIG | Generate `pyproject.toml` for {{ item.name }}"
+  ansible.builtin.template:
+    src: "{{ '../images/' + item.path + '/pyproject.toml.j2' if item.parent is none else '../config/images/universal_pyproject.toml.j2' }}"
+    dest: "../images/{{ item.path }}/pyproject.toml"
+    mode: "0644"
+
+- name: "IMAGES | Copy `pyproject.toml` into image metadata directory"
+  ansible.builtin.template:
+    src: ../images/{{ item.path }}/pyproject.toml
+    dest: ../config/jupyterhub/image-meta/{{ item.path }}/pyproject.toml
+    mode: "0644"
+
+- name: "CHECKSUM | Find files in build context for {{ item.name }}"
+  ansible.builtin.find:
+    paths: "../images/{{ item.path }}"
+    recurse: yes
+    file_type: file
+    get_checksum: yes
+  register: build_files
+      
+- name: "CHECKSUM | Create a deterministic string from all file checksums for {{ item.name }}"
+  # Map the list of file checksums to a single string.
+  # Sort the checksums before joining: without sorting, the order of files
+  # returned by the filesystem could vary, causing the final hash to change
+  # even if the files are identical.
+  ansible.builtin.set_fact:
+    checksum_input_string: "{{ build_files.files 
+      | map(attribute='checksum') 
+      | sort | join('') }}"
+
+- name: "CHECKSUM | Calculate the unified checksum for {{ item.name }}"
+  # Hash the combined string to get a single "version fingerprint" for the
+  # image directory.
+  ansible.builtin.shell:
+    cmd: "echo -n '{{ checksum_input_string }}' | sha1sum | cut -d ' ' -f1"
+  register: checksum_result
+  changed_when: false
+
+- name: "CHECKSUM | Set the `current_checksum` fact for {{ item.name }}"
+  ansible.builtin.set_fact:
+    current_checksum: "{{ checksum_result.stdout }}"
+    checksum_file_path: "/tmp/ansible_{{ item.name }}.sha1"
+
+- name: "CHECKSUM | Get previous checksum for {{ item.name }}"
+  ansible.builtin.slurp:
+    src: "{{ checksum_file_path }}"
+  register: previous_checksum_content
+  ignore_errors: true
+
+- name: "CHECKSUM | Set previous_checksum fact for {{ item.name }}"
+  ansible.builtin.set_fact:
+    previous_checksum: "{{ 'none' if previous_checksum_content.failed else previous_checksum_content.content | b64decode }}"
+
+- name: "CHECKSUM | Determine if source files have changed"
+  ansible.builtin.set_fact:
+    source_files_changed: "{{ current_checksum != previous_checksum }}"
+
+- name: "CHECKSUM | Get parent name"
+  # Resolve the parent key to the parent name using the `jupyter_images` dict.
+  # For example, reaching the iteration of `basic` image, we get:
+  # item.parent = "base"
+  # jupyter_images["base"].name = "base_image"
+  ansible.builtin.set_fact:
+    parent_name: "{{ jupyter_images[item.parent].name if item.parent else false }}"
+
+- name: "REGISTRY | Check if image '{{ item.name }}' exists in remote registry"
+  community.docker.docker_image_info:
+    name: "git.{{ parent_domain }}/{{ infra_admin_username }}/{{ item.name }}:latest"
+  register: image_info
+
+- name: "CHECKSUM | Set image_exists fact"
+  ansible.builtin.set_fact:
+    image_exists: "{{ image_info.images | length > 0 }}"
+
+- name: "CHECKSUM | Determine if a rebuild is needed"
+  # Rebuild trigger logic:
+  # 1. source_files_changes: The directory content hash differs from the last build.
+  # 2. parent_name in rebuilt_images: The parent image was just rebuilt, so 
+  #    this child must be rebuilt to inherit the changes.
+  # 3. not image_exists: The image is missing from the registry entirely.
+  ansible.builtin.set_fact:
+    rebuild_is_needed: "{{ source_files_changed or (parent_name and parent_name in rebuilt_images) or not image_exists }}"
+
+- name: "IMAGES | Build and push {{ item.name }}"
+  # Use `docker_image_build` module to ensure building with BuildKit
+  community.docker.docker_image_build:
+    name: "git.{{ parent_domain }}/{{ infra_admin_username }}/{{ item.name }}"
+    path: "../images/{{ item.path }}"
+    pull: "{{ item.pull }}"
+    rebuild: always
+    outputs:
+      - type: image
+        push: true
+  when: rebuild_is_needed
+  register: build_result
+
+- name: "CHECKSUM | Add image to rebuilt list if a build occured"
+  ansible.builtin.set_fact:
+    rebuilt_images: "{{ rebuilt_images + [item.name] }}"
+  when: rebuild_is_needed
+
+- name: "CHECKSUM | Store new checksum for {{ item.name }} after successful build"
+  ansible.builtin.copy:
+    content: "{{ current_checksum }}"
+    dest: "{{ checksum_file_path }}"
+  when: source_files_changed

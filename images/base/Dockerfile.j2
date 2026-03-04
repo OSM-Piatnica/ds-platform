@@ -1,0 +1,185 @@
+# images/base/Dockerfile.j2
+
+# syntax=docker/dockerfile:1
+
+# ==============================================================================
+# STAGE 1: Builder
+#
+# Use the full uv image which includes compilers and build tools. This stage's
+# sole purpose is to install Python packages efficiently. Its contents will be
+# discarded, except for the installed Python packages which are copied out.
+# ==============================================================================
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm AS builder
+
+# Install packages system-wide.
+# More precisely: 
+#   Use whole system as a project environment,
+#   by setting project path to the prefix of the Python installation,
+#   which on Debian-based systems is `/usr/local/`.
+ENV UV_PROJECT_ENVIRONMENT=/usr/local
+
+# Compile `.pyc` files for faster application startup.
+ENV UV_COMPILE_BYTECODE=1
+
+# Increase timeout because of problems during dependency resolution.
+ENV UV_HTTP_TIMEOUT=300
+
+# Always copy files in the containerized environment, suppressing `uv`'s
+# hardlinking warning.
+ENV UV_LINK_MODE=copy
+
+# Use BuildKit's cache mount for `uv` to speed up dependency installation
+# across builds. This cache is persisted on the Docker host, not in the image.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --no-cache
+
+# ==============================================================================
+# STAGE 2: Final Image
+#
+# Start from a slim base image that contains only the Python runtime.
+# This results in a significantly smaller and more secure final image by
+# excluding build tools, compilers, and other development dependencies.
+# ==============================================================================
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+
+# Set environment variables for consistency.
+ENV UV_PROJECT_ENVIRONMENT=/usr/local
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
+
+# Set the default shell to bash.
+ENV SHELL=/bin/bash
+
+# Set the default locale to UTF-8.
+# Ensures Python, DataFrame libraries, and database drivers (like ODBC)
+# correctly encode and decode international characters without throwing Unicode
+# parsing errors.
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
+
+# Create the `jovyan` user (UID 1000) and assign it to `users` group (GID 100).
+RUN useradd -m -s /bin/bash -N -g 100 -u 1000 jovyan
+
+# Switch to a reliable local mirror and increase timeouts/retries for Debian
+# installs due to network connectivity/stability issues.
+RUN sed -i "s/deb.debian.org\/debian/{{ debian_mirror_url }}\/debian/g" /etc/apt/sources.list.d/debian.sources \
+    && sed -i "s/{{ debian_mirror_url }}\/debian-security/deb.debian.org\/debian-security/g" /etc/apt/sources.list.d/debian.sources \
+    && echo "Acquire::http::Timeout \"60\";" > /etc/apt/apt.conf.d//99timeout \
+    && echo "Acquire::Retries \"5\";" > /etc/apt/apt.conf.d//99retries
+
+# Install essential runtime system packages.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gosu \
+    git \
+    cowsay \
+    openssh-client \
+    bzip2 \
+    unzip \
+    nano-tiny \
+    vim-tiny \
+    wget \
+    curl \
+    gnupg \
+    locales \
+    tzdata \
+    fonts-liberation \
+    pandoc \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && echo "en_US.UTF-8 UTF-8" > /etc/locale.gen \
+    && locale-gen
+
+{% if use_custom_certs %}
+
+# Install internal CA certificate, which is a runtime requirement.
+# Execute only when using custom internal certs.
+COPY internal-ca.pem /usr/local/share/ca-certificates/internal-ca.pem
+RUN update-ca-certificates
+
+{% endif %}
+
+{% if install_mssql_drivers %}
+
+# ------------------------------------------------------------------------------
+# MS SQL SERVER DRIVERS (ODBC)
+# ------------------------------------------------------------------------------
+# *** For current Data Warehouse access ***
+# ------------------------------------------------------------------------------
+# 1. Download Microsoft GPG Key.
+# 2. Add Microsoft Debian 12 (Bookworm) repository.
+# 3. Install proprietary driver `msodbcsql`, and system library `unixodbc`.
+# 4. (Optional) Install `mssql-tools` (includes `sqlcmd`), for terminal queries.
+#
+# NOTE #1: Python package `pyodbc` (interface) is installed as a part of project
+# image.
+# NOTE #2: Install only if platform relies on MS SQL Server
+# (`install_mssql_drivers` flag).
+# ------------------------------------------------------------------------------
+
+RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+    && curl https://packages.microsoft.com/config/debian/12/prod.list | tee /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
+       msodbcsql18 \
+       unixodbc-dev \
+       mssql-tools18 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Add `mssql-tools` to the fault path by symlinking to `/usr/local/bin`,
+# so that `sqlcmd` and `bcp` are accessible globally.
+RUN ln -s /opt/mssql-tools18/bin/sqlcmd /usr/local/bin/sqlcmd \
+    && ln -s /opt/mssql-tools18/bin/bcp /usr/local/bin/bcp
+
+{% endif %}
+
+# ------------------------------------------------------------------------------
+# Copy only the necessary build artifacts from the builder stage.
+# ------------------------------------------------------------------------------
+
+# Copy the installed Python packages.
+COPY --from=builder /usr/local/lib/python3.13/site-packages/ /usr/local/lib/python3.13/site-packages/
+
+# Copy the executables created by the packages.
+COPY --from=builder /usr/local/bin/ /usr/local/bin/
+
+# Copy the Jupyter config files that enable extensions, like JupyterLab.
+COPY --from=builder /usr/local/etc/jupyter/ /usr/local/etc/jupyter/
+COPY --from=builder /usr/local/share/jupyter/ /usr/local/share/jupyter/
+
+# ------------------------------------------------------------------------------
+
+# Add the entrypoint script and set permissions to make it executable.
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Add a script to run on Lab's terminal startup for a welcome message.
+COPY motd.sh /etc/profile.d/motd.sh
+RUN chmod +x /etc/profile.d/motd.sh
+
+# Copy the Jupyter Server configuration for setting options at the level 
+# of the spawned containers, and set permissions.
+COPY jupyter_server_config.py /etc/jupyter/jupyter_server_config.py
+RUN chown -R jovyan:users /etc/jupyter
+
+# Ensure the user owns its home directory.
+RUN chown -R jovyan:users /home/jovyan
+
+# Set permissions for the directories which `uv` uses when installing packages
+# (system-wide), to ensure the user can install the packages on their own at
+# runtime.
+RUN chown -R jovyan:users /usr/local/*
+
+# Configure all users in the container to use the correct username and port
+# when connecting to Forgejo instance.
+RUN echo "\nHost git.{{ parent_domain }}\n HostName forgejo\n User git\n Port 22\n GlobalKnownHostsFile /etc/ssh/known_hosts" > /etc/ssh/ssh_config.d/git.conf
+
+# Copy the pre-fetched `known_hosts` file
+COPY forgejo_known_hosts /etc/ssh/known_hosts
+
+# Set user to root and start in user directory.
+USER root
+WORKDIR /home/jovyan
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["jupyterhub-singleuser"]

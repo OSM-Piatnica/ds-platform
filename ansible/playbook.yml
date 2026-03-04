@@ -1,0 +1,1052 @@
+# ansible/playbook.yml
+
+---
+- name: DS Platform Infrastructure
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+
+  vars_files:
+    - ../secrets/vault.yml
+
+  handlers:
+    - name: Restart JupyterHub
+      community.docker.docker_compose_v2:
+        project_src: ../compose/
+        services:
+          - jupyterhub
+        state: restarted
+
+    - name: Restart Docker
+      ansible.builtin.service:
+       name: docker
+       state: restarted
+      become: true
+
+  vars:
+    # -------------------------------------------------------------------------
+    # Image Definitions
+    # -------------------------------------------------------------------------
+
+    # Use dictionary definition to allow lookup, like, e.g.:
+    # `jupyter_images.base.name`
+    jupyter_images:
+      base:
+        name: "base_image"
+        path: "base"
+        display_name: "Base"
+        parent: null
+        pull: yes
+
+      # --- CPU images ---
+      basic-cpu:
+        name: "basic-cpu_image"
+        path: "basic-cpu"
+        display_name: "Basic Data Analysis [CPU]"
+        parent: "base" 
+        pull: no
+        
+      big-data-cpu:
+        name: "big-data-cpu_image"
+        path: "big-data-cpu"
+        display_name: "Big Data [CPU]"
+        parent: "basic-cpu"
+        pull: no
+      
+      ml-cpu:
+        name: "ml-cpu_image"
+        path: "ml-cpu"
+        display_name: "Classical ML [CPU]"
+        parent: "big-data-cpu"
+        pull: no
+
+      optimization-cpu:
+        name: "optimization-cpu_image"
+        path: "optimization-cpu"
+        display_name: "Optimization [CPU]"
+        parent: "ml-cpu"
+        pull: no
+
+      time-series-cpu:
+        name: "time-series-cpu_image"
+        path: "time-series-cpu"
+        display_name: "Time-Series [CPU]"
+        parent: "ml-cpu"
+        pull: no
+
+      geospatial-cpu:
+        name: "geospatial-cpu_image"
+        path: "geospatial-cpu"
+        display_name: "Geospatial Toolkit [CPU]"
+        parent: "ml-cpu"
+        pull: no
+
+      dl-base-cpu:
+        name: "dl-base-cpu_image"
+        path: "dl-base-cpu"
+        display_name: "Deep Learning Base [CPU]"
+        parent: "ml-cpu"
+        pull: no
+
+      dl-cv-cpu:
+        name: "dl-cv-cpu_image"
+        path: "dl-cv-cpu"
+        display_name: "Deep Learning: CV [CPU]"
+        parent: "dl-base-cpu"
+        pull: no
+
+      dl-nlp-cpu:
+        name: "dl-nlp-cpu_image"
+        path: "dl-nlp-cpu"
+        display_name: "Deep Learning: NLP [CPU]"
+        parent: "dl-base-cpu"
+        pull: no
+
+      # --- GPU images ---
+      basic-gpu:
+        name: "basic-gpu_image"
+        path: "basic-gpu"
+        display_name: "Basic Data Analysis [GPU]"
+        parent: "basic-cpu"
+        pull: no
+
+      big-data-gpu:
+        name: "big-data-gpu_image"
+        path: "big-data-gpu"
+        display_name: "Big Data [GPU]"
+        parent: "basic-gpu"
+        pull: no
+
+      ml-gpu:
+        name: "ml-gpu_image"
+        path: "ml-gpu"
+        display_name: "Classical ML [GPU]"
+        parent: "big-data-gpu"
+        pull: no
+        
+      optimization-gpu:
+        name: "optimization-gpu_image"
+        path: "optimization-gpu"
+        display_name: "Optimization [GPU]"
+        parent: "ml-gpu"
+        pull: no
+
+      time-series-gpu:
+        name: "time-series-gpu_image"
+        path: "time-series-gpu"
+        display_name: "Time-Series [GPU]"
+        parent: "ml-gpu"
+        pull: no
+
+      geospatial-gpu:
+        name: "geospatial-gpu_image"
+        path: "geospatial-gpu"
+        display_name: "Geospatial Toolkit [GPU]"
+        parent: "ml-gpu"
+        pull: no
+
+      dl-base-gpu:
+        name: "dl-base-gpu_image"
+        path: "dl-base-gpu"
+        display_name: "Deep Learning Base [GPU]"
+        parent: "ml-gpu"
+        pull: no
+
+      dl-cv-gpu:
+        name: "dl-cv-gpu_image"
+        path: "dl-cv-gpu"
+        display_name: "Deep Learning: CV [GPU]"
+        parent: "dl-base-gpu"
+        pull: no
+
+      dl-nlp-gpu:
+        name: "dl-nlp-gpu_image"
+        path: "dl-nlp-gpu"
+        display_name: "Deep Learning: NLP [GPU]"
+        parent: "dl-base-gpu"
+        pull: no
+
+    # Directories under which image-named subdirectories should exist.
+    image_path_prefixes:
+      - "../config/jupyterhub/image-meta/"
+      - "../images/"
+
+    # -------------------------------------------------------------------------
+    # Directory Definitions
+    # -------------------------------------------------------------------------
+
+    _static_proj_dirs:
+      - path: ../config/alloy
+      - path: ../config/authelia
+      - path: ../config/caddy
+      - path: ../config/forgejo
+      - path: ../config/grafana/provisioning/alerting
+      - path: ../config/grafana/provisioning/dashboards
+      - path: ../config/grafana/provisioning/datasources
+      - path: ../config/grafana/provisioning/plugins
+      - path: ../config/loki
+      - path: ../config/prometheus
+      - path: ../config/jupyterhub/scripts
+      - path: ../config/jupyterhub/image-meta
+      - path: ../services/jupyterhub
+      - path: ../ansible/scripts/pruner
+      - path: ../dashboards
+      - path: ../docs_onboarding
+
+    # Add subdirectories which use image names.
+    # Concatenate the static list of config directory paths 
+    # with dynamically created paths.
+    proj_dirs: >-
+      {{
+        _static_proj_dirs +
+        (
+          jupyter_images.values()
+          | map(attribute='path')
+          | product(image_path_prefixes)
+          | map('reverse')
+          | map('join')
+          | map('regex_replace', '^(.*)$', '{"path": "\1"}')
+          | map('from_json')
+          | list
+        )
+      }}
+
+    # -------------------------------------------------------------------------
+    # Persistent Storage Permissions 
+    # (UID/GID Mappings based on information provided in the official Docker images)
+    # -------------------------------------------------------------------------
+    
+    persistent_data_dirs:
+      - path: /srv/postgresql_data
+        owner: 999
+        group: 999
+        mode: "0700" # Database files should be strictly private
+
+      - path: /srv/valkey_data
+        owner: 999
+        group: 999
+        mode: "0700" # Database files should be strictly private
+
+      - path: /srv/forgejo_data
+        owner: 1000
+        group: 1000
+        mode: "0750"
+
+      - path: /srv/jupyterhub_data
+        owner: 1000
+        group: 1000
+        mode: "0750"
+
+      - path: /srv/jupyterhub_data/service # "jovyan" (1000:1000) user: see service image Dockerfile
+        owner: 1000
+        group: 1000
+        mode: "0750"
+
+      - path: /srv/jupyterhub_data/users # "jovyan" (1000:100) user: see spawned images' Dockerfiles
+        owner: 1000
+        group: 100
+        mode: "0755" # Users need traversal rights
+
+      - path: /srv/prometheus_data
+        owner: 65534
+        group: 65534
+        mode: "0750"
+
+      - path: /srv/loki_data
+        owner: 10001
+        group: 10001
+        mode: "0750"
+
+      - path: /srv/grafana_data
+        owner: 472
+        group: 472
+        mode: "0750"
+
+      - path: /srv/alloy_data
+        owner: 473
+        group: 473
+        mode: "0750"
+
+    # -------------------------------------------------------------------------
+    # Script Definitions
+    # -------------------------------------------------------------------------
+
+    infra_scripts:
+      - path: ../compose/init-db.sh
+      - path: ../images/base/entrypoint.sh
+      - path: ../images/base/motd.sh
+      - path: ../config/jupyterhub/scripts/del_proj_dir.sh
+      - path: ../ansible/scripts/pruner/prune_orphaned_containers.py
+
+    #grafana_dashboards:
+    #  - { id: 1860, name: "starter_host_metrics_node-exporter-full" }
+    #  - { id: 19724, name: "starter_container_metrics_cadvisor" }
+    #  - { id: 23789, name: "starter_logging_metrics_volume" }
+
+  tasks:
+    #- name: "DEBUG | Print all available facts"
+    #  ansible.builtin.debug:
+    #    var: ansible_facts
+    
+    - name: "DEBUG | Display the project root based on `playbook_dir` magic var"
+      ansible.builtin.debug:
+        msg: "The project root is: {{ playbook_dir | dirname }}"
+ 
+    # =========================================================================
+    # SECURITY & SECRETS MANAGEMENT
+    # =========================================================================
+    
+    - name: "SECURITY | Ensure Ansible Vault password file is strictly secured"
+      ansible.builtin.file:
+        path: ../secrets/.vault_pass
+        mode: "0600"
+
+    - name: "SECURITY | Enforce permissions on Vault file"
+      ansible.builtin.file:
+        path: ../secrets/vault.yml
+        mode: "0600"
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+
+    - name: "SECURITY | Ensure secrets directory exists with restrictive permissions"
+      ansible.builtin.file:
+        path: ../secrets
+        mode: "0700" # Access only by the deploying user
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+
+    - name: "SECURITY | Ensure certs directory exists with restrictive permissions"
+      ansible.builtin.file:
+        path: ../secrets/certs
+        mode: "0700" # Access only by the deploying user
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+
+    - name: "SECURITY | Ensure TLS Private Keys are strictly secured (0600)"
+      ansible.builtin.file:
+        path: "../secrets/certs/{{ cert_key }}"
+        mode: "0600"
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+      # Execute only when using custom certs.
+      when: use_custom_certs | default(false)
+
+    - name: "SECURITY | Ensure TLS Certificates are readable (0644)"
+      ansible.builtin.file:
+        path: "../secrets/certs/{{ cert_pem }}"
+        mode: "0644"
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+      # Execute only when using custom certs.
+      when: use_custom_certs | default(false)
+
+    - name: "SECRETS | Ensure all secret files exist"
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - { content: "{{ authelia_jwt_secret }}", dest: "../secrets/authelia_jwt_secret.txt" }
+        - { content: "{{ authelia_session_secret }}", dest: "../secrets/authelia_session_secret.txt" }
+        - { content: "{{ authelia_storage_encryption_key }}", dest: "../secrets/authelia_storage_encryption_key.txt" }
+        - { content: "{{ authelia_oidc_private_key }}", dest: "../secrets/authelia_oidc_private_key.txt" }
+        - { content: "{{ postgres_root_password }}", dest: "../secrets/postgres_root_password.txt" }
+        - { content: "{{ authelia_db_password }}", dest: "../secrets/authelia_db_password.txt" }
+        - { content: "{{ forgejo_db_password }}", dest: "../secrets/forgejo_db_password.txt" }
+        - { content: "{{ jupyterhub_db_password }}", dest: "../secrets/jupyterhub_db_password.txt" }
+        - { content: "{{ grafana_db_password }}", dest: "../secrets/grafana_db_password.txt" }
+        - { content: "{{ valkey_password }}", dest: "../secrets/valkey_password.txt" }
+        - { content: "{{ smtp_password }}", dest: "../secrets/smtp_password.txt" }
+        - { content: "{{ authelia_oidc_hmac_secret }}", dest: "../secrets/authelia_oidc_hmac_secret.txt" }
+        - { content: "{{ jupyterhub_oidc_client_secret }}", dest: "../secrets/jupyterhub_oidc_client_secret.txt" }
+        - { content: "{{ jupyterhub_oidc_client_secret_hash }}", dest: "../secrets/jupyterhub_oidc_client_secret_hash.txt" }
+        - { content: "{{ jupyterhub_cookie_secret }}", dest: "../secrets/jupyterhub_cookie_secret.txt" }
+        - { content: "{{ jupyterhub_crypt_key }}", dest: "../secrets/jupyterhub_crypt_key.txt" }
+        - { content: "{{ forgejo_oidc_client_secret }}", dest: "../secrets/forgejo_oidc_client_secret.txt" }
+        - { content: "{{ forgejo_oidc_client_secret_hash }}", dest: "../secrets/forgejo_oidc_client_secret_hash.txt" }
+        - { content: "{{ forgejo_secret_key }}", dest: "../secrets/forgejo_secret_key.txt" }
+        - { content: "{{ forgejo_internal_token }}", dest: "../secrets/forgejo_internal_token.txt" }
+        - { content: "{{ grafana_oidc_client_secret }}", dest: "../secrets/grafana_oidc_client_secret.txt" }
+        - { content: "{{ grafana_oidc_client_secret_hash }}", dest: "../secrets/grafana_oidc_client_secret_hash.txt" }
+        - { content: "{{ minio_access_key }}", dest: "../secrets/minio_access_key.txt" }
+        - { content: "{{ minio_secret_key }}", dest: "../secrets/minio_secret_key.txt" }
+        - { content: "{{ minio_endpoint }}", dest: "../secrets/minio_endpoint.txt" }
+        - { content: "{{ minio_bucket_name }}", dest: "../secrets/minio_bucket_name.txt" }
+        - { content: "{{ ms_teams_webhook_url }}", dest: "../secrets/ms_teams_webhook_url.txt" }
+        - { content: "{{ infra_admin_pass }}", dest: "../secrets/infra_admin_pass.txt" }
+      no_log: true # Prevent secrets from being logged
+
+    - name: "SECURITY | Generate static SSH host key for Forgejo"
+      ansible.builtin.command:
+        cmd: ssh-keygen -t ed25519 -N "" -f ../secrets/forgejo_ssh_host_key
+        creates: ../secrets/forgejo_ssh_host_key
+      # This generates both the private key and the `.pub` file locally.
+
+    - name: "SECURITY | Set permissions for Forgejo private key"
+      ansible.builtin.file:
+        path: ../secrets/forgejo_ssh_host_key
+        mode: "0600"
+
+    - name: "SECURITY | Set permissions for Forgejo public key"
+      ansible.builtin.file:
+        path: ../secrets/forgejo_ssh_host_key.pub
+        mode: "0644"
+
+    # =========================================================================
+    # FILESYSTEM & DIRECTORY SETUP
+    # =========================================================================
+
+    - name: "FILESYSTEM | Ensure correct project directory structure exists"
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ proj_dirs }}"
+
+    - name: "FILESYSTEM | Ensure persistent data directories exist with correct UID and GID"
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+      loop: "{{ persistent_data_dirs }}"
+      become: true # Required to change ownership to arbitrary UIDs/GIDs
+      notify: Restart Docker
+
+    - name: "FILESYSTEM | Ensure configuration directories are traversable (0755)"
+      ansible.builtin.command:
+        cmd: find ../config -type d -exec chmod 0755 {} \;
+      changed_when: false
+
+    - name: "FILESYSTEM | Ensure configuration files are readable by container users (0644)"
+      ansible.builtin.command:
+        cmd: find ../config -type f -exec chmod 0644 {} \;
+      changed_when: false
+
+    - name: "SCRIPTS | Generate 'Message of the Day' script"
+      ansible.builtin.template:
+        src: ../images/base/motd.sh.j2
+        dest: ../images/base/motd.sh
+        mode: "0644"
+      no_log: true
+
+    - name: "FILESYSTEM | Ensure infrastructure scripts are executable"
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        mode: "0755"
+      loop: "{{ infra_scripts }}"
+
+          #- name: Download Starter Grafana Dashboards
+          #  ansible.builtin.get_url:
+          #    url: "https://grafana.com/api/dashboards/{{ item.id }}/revisions/latest/download"
+          #    dest: "../config/grafana/provisioning/dashboards/{{ item.name }}.json"
+          #    mode: "0644"
+          #  loop: "{{ grafana_dashboards }}"
+
+          #- name: Fix Datasource in provisioned prometheus-based dashboards
+          #  # This task find "${DS_PROMETHEUS}" in the JSON files and
+          #  # replaces it with the stable UID "prometheus-main" set
+          #  # in `datasources.yml`, preventing issue with automated import
+          #  # of dashboards.
+          #  # (Many dashboards are designed to be imported manually through
+          #  # the Grafana UI, during which Grafana prompts to select a data
+          #  # source which is saved to the aforementioned variable.
+          #  # When provisioning via a file, this "link" is never established.)
+          #  ansible.builtin.replace:
+          #    path: "../config/grafana/provisioning/dashboards/{{ item.name }}.json"
+          #    regexp: "(?i){{ '${DS_PROMETHEUS}' | regex_escape() }}"
+          #    replace: "prometheus-main"
+          #  loop: "{{ grafana_dashboards }}"
+
+          #- name: Fix Datasource in provisioned loki-based dashboards
+          #  ansible.builtin.replace:
+          #    path: "../config/grafana/provisioning/dashboards/{{ item.name }}.json"
+          #    regexp: "(?i){{ '${DS_LOKI}' | regex_escape() }}"
+          #    replace: "loki-main"
+          #  loop: "{{ grafana_dashboards }}"
+
+    - name: "FILESYSTEM | Copy Custom Dashboards into config directory mounted by Compose"
+      ansible.builtin.copy:
+        src: ../dashboards/
+        dest: ../config/grafana/provisioning/dashboards/
+        mode: "0644"
+
+    # =========================================================================
+    # VARIABLE COLLECTION / FACT SETTING
+    # =========================================================================
+
+    # -------------------------------------------------------
+    # DYNAMIC GID FETCHING
+    # -------------------------------------------------------
+
+    - name: "SYSTEM | Get Docker group info"
+      ansible.builtin.getent:
+        database: group
+        key: docker
+
+    - name: "SYSTEM | Set Docker GID fact"
+      ansible.builtin.set_fact:
+        # getent_group returns a dict: {'docker': ['x', '994', 'members...']}
+        # Index 1 is the GID.
+        docker_gid: "{{ getent_group.docker[1] }}"
+          
+    # =========================================================================
+    # PRE-DEPLOYMENT SYSTEM CONFIGURATION
+    # =========================================================================
+    
+    # -------------------------------------------------------------------------
+    # HARDWARE CONFIGURATION
+    # -------------------------------------------------------------------------
+
+    - name: "HARDWARE | Ensure `pciutils` is installed for GPU detection"
+      ansible.builtin.apt:
+        name: pciutils
+        state: present
+      become: true
+
+    - name: "HARDWARE | Check for NVIDIA GPU presence on the PCI bus"
+      ansible.builtin.shell: "lspci | grep -i nvidia"
+      register: gpu_check
+      failed_when: false
+      changed_when: false
+
+    - name: "HARDWARE | Set GPU fact"
+      ansible.builtin.set_fact:
+        host_has_gpu: "{{ gpu_check.rc == 0 }}"
+        
+    - name: "HARDWARE | Display GPU Status"
+      ansible.builtin.debug:
+        msg: "NVIDIA GPU detected: {{ host_has_gpu }}. GPU image builds will be {{ 'enabled' if host_has_gpu else 'skipped' }}."
+
+    - name: "HARDWARE | Add NVIDIA Container Toolkit GPG key"
+      ansible.builtin.shell: |
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+      become: true
+      when: host_has_gpu | default(false)
+
+    - name: "HARDWARE | Add NVIDIA Container Toolkit repository"
+      ansible.builtin.shell: |
+        curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+      args:
+        creates: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+      become: true
+      when: host_has_gpu | default(false)
+
+    - name: "HARDWARE | Install nvidia-container-toolkit"
+      ansible.builtin.apt:
+        name: nvidia-container-toolkit
+        state: present
+        update_cache: yes
+      become: true
+      when: host_has_gpu | default(false)
+
+    # -------------------------------------------------------------------------
+
+    # Fix memory overcommit warning.
+    # This prevents crashes during background saves or replication.
+    - name: "SYSTEM | Configure vm.overcommit_memory for Valkey"
+      ansible.posix.sysctl:
+        name: vm.overcommit_memory
+        value: '1'
+        state: present
+        reload: yes
+      become: true
+      delegate_to: localhost
+      no_log: true
+
+    # Fix for Caddy warnings.
+    - name: "SYSTEM | Optimize UDP buffer sized for Caddy (HTTP/3)"
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: "2500000"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/99-caddy-quic.conf
+      become: true
+      delegate_to: localhost
+      loop:
+        - net.core.rmem_max
+        - net.core.wmem_max
+      no_log: true
+
+    # =========================================================================
+    # CONFIGURATION TEMPLATING
+    # =========================================================================
+    
+    - name: "CONFIG | Generate Caddy config from template"
+      ansible.builtin.template:
+        src: ../config/caddy/Caddyfile.j2
+        dest: ../config/caddy/Caddyfile
+        mode: "0644"
+      no_log: true # Prevent secrets from being logged
+
+    - name: "CONFIG | Generate logout script from template"
+      ansible.builtin.template:
+        src: ../config/caddy/logout-all.html.j2
+        dest: ../config/caddy/logout-all.html
+        mode: "0644"
+      no_log: true # Prevent secrets from being logged
+
+    - name: "CONFIG | Generate Authelia config from template"
+      ansible.builtin.template:
+        src: ../config/authelia/configuration.yml.j2
+        dest: ../config/authelia/configuration.yml
+        mode: "0644"
+      no_log: true # Prevent secrets from being logged
+
+    - name: "CONFIG | Generate Users Database config from template"
+      ansible.builtin.template:
+        src: ../config/authelia/users_database.yml.j2
+        dest: ../config/authelia/users_database.yml
+        mode: "0644"
+      no_log: true # Prevent secrets from being logged
+
+    - name: "CONFIG | Generate Forgejo config from template"
+      ansible.builtin.template:
+        src: ../config/forgejo/app.ini.j2
+        dest: ../config/forgejo/app.ini
+        mode: "0644"
+        owner: 1000
+        group: 1000
+      become: true # Required to set owner/group
+      no_log: true # Prevent secrets from being logged
+
+    - name: "CONFIG | Generate Grafana configuration from template"
+      ansible.builtin.template:
+        src: ../config/grafana/grafana.ini.j2
+        dest: ../config/grafana/grafana.ini
+        mode: "0644"
+      no_log: true # Prevent secrets from being logged
+
+    - name: "CONFIG | Generate Grafana contact point configuration from template"
+      ansible.builtin.template:
+        src: ../config/grafana/provisioning/alerting/contact-point.yml.j2
+        dest: ../config/grafana/provisioning/alerting/contact-point.yml
+        mode: "0644"
+      no_log: true # Prevent secrets from being logged
+
+    - name: "CONFIG | Generate JupyterHub config from template"
+      ansible.builtin.template:
+        src: ../config/jupyterhub/jupyterhub_config.py.j2
+        dest: ../config/jupyterhub/jupyterhub_config.py
+        mode: "0644"
+      no_log: true # Prevent secrets from being logged
+      notify: Restart JupyterHub
+
+    - name: "CONFIG | Generate Docker Compose config from template"
+      ansible.builtin.template:
+        src: ../compose/docker-compose.yml.j2
+        dest: ../compose/docker-compose.yml
+        mode: "0644"
+      no_log: true # Prevent secrets from being logged
+
+    # =========================================================================
+    # CONTAINER DEPLOYMENT    
+    # =========================================================================
+
+    - name: "BUILD | Build custom JupyterHub image"
+      community.docker.docker_image:
+        name: jupyterhub-custom:latest
+        build:
+          path: ../services/jupyterhub/
+        source: build
+        state: present
+        force_source: true
+      notify: Restart JupyterHub
+
+    - name: "DEPLOY | Deploy all the services"
+      community.docker.docker_compose_v2:
+        project_src: ../compose
+        state: present
+      register: compose_result
+
+    - name: "DEPLOY | Wait for services to be healthy"
+      community.docker.docker_container_info:
+        name: "{{ item }}"
+      register: container_info
+      # Check the nested dictionary: State -> Health -> Status
+      until: container_info.container.State.Health.Status == 'healthy'
+      retries: 60   # Wait up to 5 minutes (60 * 5s)
+      delay: 5
+      loop:
+           - postgresql 
+           - valkey 
+           - authelia
+           - forgejo
+           - jupyterhub
+           - grafana
+           - caddy
+
+              #- name: "DEPLOY | Wait for services to initialize"
+              #  ansible.builtin.pause:
+              #    seconds: 10
+              #  run_once: true
+
+    # =========================================================================
+    # POST-DEPLOYMENT CONFIGURATION
+    # =========================================================================
+
+    # -------------------------------------------------------------------------
+    # FORGEJO CONFIGURATION
+    # -------------------------------------------------------------------------
+
+    - name: "FORGEJO | Run Forgejo database migrations"
+      # This command is safe to run multiple times
+      community.docker.docker_container_exec:
+        container: forgejo
+        user: "git" # Use non-root user to execute command, otherwise it will fail
+        command: forgejo migrate
+ 
+    - name: "FORGEJO | Configure Forgejo OIDC provider"
+      # This task adds the Authelia SSO provider to Forgejo
+      community.docker.docker_container_exec:
+        container: forgejo
+        user: "git" # Use non-root user to execute command, otherwise it will fail
+        command: >
+          forgejo admin auth add-oauth
+          --provider=openidConnect
+          --name=authelia
+          --key=forgejo
+          --secret={{ forgejo_oidc_client_secret }}
+          --auto-discover-url=https://auth.{{ parent_domain }}/.well-known/openid-configuration
+          --scopes="openid email profile groups"
+      register: oauth_add_result
+      failed_when: "'Failed' in oauth_add_result.stderr and 'auth source has
+        already existed' not in oauth_add_result.stderr"
+      changed_when: "'successfully' in oauth_add_result.stdout"
+
+    - name: "FORGEJO | Verify Forgejo authentication sources"
+      community.docker.docker_container_exec:
+        container: forgejo
+        user: "git" # Use non-root user to execute command, otherwise it will fail
+        command: forgejo admin auth list
+      register: auth_list_result
+
+    - name: "FORGEJO | Display authentication sources"
+      ansible.builtin.debug:
+        msg: "{{ auth_list_result.stdout_lines }}"
+
+    - name: "FORGEJO | Create Forgejo Admin user"
+      community.docker.docker_container_exec:
+        container: forgejo
+        command: >
+          forgejo admin user create
+          --name "{{ infra_admin_username }}"
+          --password "{{ infra_admin_pass }}"
+          --email "{{ infra_admin_email }}"
+          --admin
+        user: "git"
+      register: create_admin_result
+      # This task is successful even if it fails, 
+      # as long as the failure is "user already exists"
+      failed_when: "'Failed' in create_admin_result.stderr and 'user already
+        exists' not in create_admin_result.stderr"
+
+    # -------------------------------------------------------------------------
+
+    - name: "REGISTRY | Ensure Docker certs directory for the registry exists"
+      ansible.builtin.file:
+        path: "/etc/docker/certs.d/git.{{ parent_domain }}"
+        state: directory
+        mode: "0755"
+      become: true
+      # Execute only when using custom certs.
+      when: use_custom_certs | default(false)
+
+    - name: "REGISTRY | Copy internal CA to Docker certs directory"
+      ansible.builtin.copy:
+        src: ../secrets/certs/{{ cert_pem }}
+        dest: "/etc/docker/certs.d/git.{{ parent_domain }}/ca.pem"
+        mode: "0644"
+      become: true
+      notify: Restart Docker # This will trigger the handler if the file changes
+      # Execute only when using custom certs.
+      when: use_custom_certs | default(false)
+
+    - name: "REGISTRY | Configure Docker daemon (JSON logging & metrics)"
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        # Set a global default for all containers,
+        # limiting each to three log files of 10MB each
+        # (30MB total maximum per container).
+        content: |
+          {
+            "live-restore": true,
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "metrics-addr": "127.0.0.1:9323",
+            "experimental": true{% if host_has_gpu | default(false) %},
+            "runtimes": {
+                "nvidia": {
+                    "args": [],
+                    "path": "nvidia-container-runtime"
+                }
+            }{% endif %}
+          }
+        mode: "0644"
+      become: true
+      notify: Restart Docker
+
+
+    - name: "REGISTRY | Flush handlers to restart Docker if needed"
+      meta: flush_handlers
+
+    - name: "REGISTRY | Log into Forgejo Docker Registry"
+      community.docker.docker_login:
+        registry: "git.{{ parent_domain }}"
+        username: "{{ infra_admin_username }}"
+        password: "{{ infra_admin_pass }}"
+      no_log: true
+
+    - name: "IMAGES | Generate `Base` image Dockerfile from template"
+      ansible.builtin.template:
+        src: "../images/base/Dockerfile.j2"
+        dest: "../images/base/Dockerfile"
+        mode: "0644"
+      no_log: true
+
+    - name: "IMAGES | Generate universal Dockerfiles"
+      ansible.builtin.template:
+        src: "../config/images/universal_Dockerfile.j2"
+        dest: "../images/{{ item.path }}/Dockerfile"
+        mode: "0644"
+      loop: "{{ jupyter_images.values() | list }}"
+      no_log: true
+      when: item.parent is not none # Skip if no parent (`Base` image)
+
+    - name: "IMAGES | Copy CA cert to build context for `base_image`"
+      ansible.builtin.copy:
+        src: ../secrets/certs/{{ cert_pem }}
+        dest: ../images/base/internal-ca.pem
+        mode: "0644"
+      # Execute only when using custom certs.
+      when: use_custom_certs | default(false)
+
+    - name: "IMAGES | Read Forgejo public key"
+      ansible.builtin.slurp:
+        src: ../secrets/forgejo_ssh_host_key.pub
+      register: forgejo_pub_key
+
+    - name: "IMAGES | Create `forgejo_known_hosts` for Base Image"
+      ansible.builtin.copy:
+        # Define the host as 'forgejo' as that is the HostName
+        # defined in the `ssh_config` inside the container.
+        content: "forgejo {{ forgejo_pub_key['content'] | b64decode }}"
+        dest: "../images/base/forgejo_known_hosts"
+        mode: "0644"
+
+    - name: "IMAGES | Initialize list of rebuilt images"
+      ansible.builtin.set_fact:
+        rebuilt_images: []
+
+    - name: "IMAGES | Build-Push Docker images"
+      ansible.builtin.include_tasks: ./aux_tasks/build_push_img.yml
+      ##
+      # IMPORTANT: The loop must be in dependency order (parent before
+      # child). See definition of `jupyter_images` var, specifically
+      # the `parent` value.
+      ##
+      # `jupyter_images` is dict: loop over values to get list of image
+      # objects (this maintains compatibility with the aux task).
+      ##
+      loop: "{{ jupyter_images.values() | list }}"
+      # Skip GPU image build if no host GPU detected.
+      when: >
+        ('-gpu' not in item.name) or
+        ('-gpu' in item.name and host_has_gpu)
+
+    - name: "REGISTRY | Log out of Forgejo Docker Registry"
+      community.docker.docker_login:
+        registry: "git.{{ parent_domain }}"
+        state: absent
+
+    - name: "IMAGES | Print Docker Compose output"
+      ansible.builtin.debug:
+        var: compose_result
+
+    # =========================================================================
+    # ONBOARDING REPOSITORY & DOCUMENTATION
+    # =========================================================================
+
+    - name: "DOCS | Generate `SECURITY.md` file informing how to privately report vulnerabilities"
+      ansible.builtin.template:
+        src: "../docs_onboarding/SECURITY.md.j2"
+        dest: "../SECURITY.md"
+        mode: "0644"
+
+    - name: "DOCS | Generate Open-Source Admin Guide"
+      ansible.builtin.template:
+        src: "../docs_onboarding/ADMIN_GUIDE.md.j2"
+        dest: "../README.md"
+        mode: "0644"
+      vars:
+        parent_domain: mydomain.com
+        cert_pem: cert.pem
+        cert_key: cert.key
+        vm_ip: "999.99.99.99"
+        infra_admin_username: "infra-admin"
+
+    - name: "DOCS | Create staging directory for documentation"
+      ansible.builtin.file:
+        path: "/tmp/onboarding_stage"
+        state: directory
+        mode: "0755"
+
+    - name: "DOCS | Template the Onboarding Content"
+      ansible.builtin.template:
+        src: "../docs_onboarding/{{ item }}.j2"
+        dest: "/tmp/onboarding_stage/{{ item }}"
+        mode: "0644"
+      loop:
+        - setup_local_git_access.py
+        - USER_GUIDE.md
+        - ADMIN_GUIDE.md
+
+    - name: "DOCS | Ensure `onboarding` repository exists in Forgejo"
+      ansible.builtin.uri:
+        # Using localhost because Ansible runs on the host network.
+        url: "http://localhost:3000/api/v1/user/repos"
+        method: POST
+        user: "{{ infra_admin_username }}"
+        password: "{{ infra_admin_pass }}"
+        force_basic_auth: yes
+        body_format: json
+        body:
+          name: "onboarding"
+          description: "Official Platform Documentation and Setup Scripts"
+          private: false
+          auto_init: false
+        status_code: [201, 409] # 201=Created, 409=Already Exists
+      register: create_repo_result
+      changed_when: create_repo_result.status == 201
+
+    - name: "DOCS | Push the Onboarding Content to Forgejo"
+      ansible.builtin.shell:
+        cmd: |
+          # 1. Initialize safe git env
+          git init
+          git config user.name "{{ infra_admin_displayname }}"
+          git config user.email "{{ infra_admin_email }}"
+
+          # 2. Stage all files
+          git add .
+
+          # 3. Check if commit is needed.
+          #    Use `git rev-parse` to check if HEAD exists (first run).
+          #    If HEAD exists, check `diff-index`.
+          #    If no HEAD, we assume changes exist.
+          if ! git rev-parse --verify HEAD >/dev/null 2>&1 || \
+             ! git diff-index --quiet HEAD --; then
+
+             git commit -m "Automated update via Ansible"
+
+             # 4. Push (force overwrite to ensure repo matches Ansible exactly).
+             #    Note: Use the internal serivce name 'forgejo' in the URL if
+             #    DNS is mapped, but 'localhost' is safer from the host
+             #    machine.
+             git remote add origin "http://{{ infra_admin_username }}:{{ infra_admin_pass }}@localhost:3000/{{ infra_admin_username }}/onboarding.git"
+             git push -u origin master --force
+
+             echo "changed=true"
+          else
+             echo "changed=false"
+          fi
+      args:
+        chdir: "/tmp/onboarding_stage"
+      register: git_push_result
+      changed_when: "'changed=true' in git_push_result.stdout"
+      no_log: true # Prevent secrets from being logged
+             
+    # =========================================================================
+    # MAINTENANCE AUTOMATION
+    # =========================================================================
+
+    - name: "MAINTENANCE | Build container-pruner image"
+      community.docker.docker_image:
+        name: jupyterhub-pruner:latest
+        build:
+          path: ./scripts/pruner/
+          nocache: true
+        source: build
+        state: present
+        force_source: true
+
+    - name: "MAINTENANCE | Schedule nightly cron job for JupyterHub container pruning"
+      ansible.builtin.cron:
+        name: "JupyterHub Orphaned Container Prune"
+        hour: "3" # Run at 3:00AM every day.
+        minute: "0"
+        user: "{{ infra_admin_username }}"
+        job: >
+          docker run --rm
+          --network ds-backend-net
+          --user 1000:{{ docker_gid }}
+          -v /var/run/docker.sock:/var/run/docker.sock
+          -e JUPYTERHUB_DB_PASSWORD={{ jupyterhub_db_password }}
+          jupyterhub-pruner:latest
+
+
+    # =========================================================================
+    # BACKUP STRATEGY (RESTIC)
+    # =========================================================================
+
+    - name: "BACKUP | Install Restic and Gzip"
+      ansible.builtin.apt:
+        pkg:
+          - restic
+          - gzip # Used in backup script
+        state: present
+        update_cache: yes
+      become: true
+
+    - name: "BACKUP | Generate Restic password file"
+      ansible.builtin.copy:
+        content: "{{ restic_password }}"
+        dest: "../secrets/restic_password.txt"
+        mode: "0644"
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+
+    - name: "BACKUP | Ensure backup root directory exists"
+      ansible.builtin.file:
+        path: "/srv/backups"
+        state: directory
+        mode: "0700"
+        owner: root
+      become: true
+
+    - name: "BACKUP | Create log file for observability"
+      ansible.builtin.file:
+        path: /var/log/backup.log
+        state: touch
+        mode: "0644"
+        owner: root
+      become: true
+
+    - name: "BACKUP | Generate Backup Script"
+      ansible.builtin.template:
+        src: ./scripts/backup.sh.j2
+        dest: /usr/local/bin/run-backup.sh
+        mode: "0700"
+        owner: root
+      become: true
+
+    - name: "BACKUP | Schedule Nightly Backup (4:00 AM)"
+      ansible.builtin.cron:
+        name: "Platform Restic Backup"
+        hour: "4"
+        minute: "0"
+        # Avoid interference with running Notebooks:
+        # - `nice -n 19`: Lowest CPU Priority.
+        # - `ionice -c 2 -n 7`: Best Effort, Lowest Priority.
+        # Redirect both stdout and stderr to the log file Alloy watches.
+        job: "/usr/bin/nice -n 19 /usr/bin/ionice -c 2 -n 7 /usr/local/bin/run-backup.sh >> /var/log/backup.log 2>&1"
+        user: root
+      become: true

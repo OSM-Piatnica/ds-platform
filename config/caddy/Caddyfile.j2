@@ -1,0 +1,276 @@
+# config/caddy/Caddyfile.j2
+
+# Reusable snippet for TLS configuration.
+(tls) {
+{% if use_custom_certs %}
+    # Custom certificates
+	tls /etc/caddy/certs/{{ cert_pem }} /etc/caddy/certs/{{ cert_key }}
+{% else %}
+    # Automatic HTTPS (Let's Encrypt)
+    tlse {{ acme_email }}
+{% endif %}
+}
+
+# Reusable snippet for Authelia forward authentication.
+(authelia) {
+	forward_auth authelia:9091 {
+		uri /api/authz/forward-auth
+		copy_headers Remote-User, Remote-Groups, Remote-Name, Remote-Email
+	}
+}
+
+# Reusable snippet for security hardening.
+(security_headers) {
+    header {
+        # Prevent MIME sniffing vulnerabilities.
+        X-Content-Type-Options "nosniff"
+        
+        # CSP: Allow this site to be framed by itself AND the auth domain (for logout-all.html).
+        Content-Security-Policy "frame-ancestors 'self' https://auth.{{ parent_domain }}"
+        
+        # Enable HTTP Strict Transport Security (HSTS).
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        
+        # Referrer Policy.
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}
+
+
+# `auth` Subdomain (Authelia)
+auth.{{ parent_domain }} {
+
+	import tls
+    
+    # Global header for cache control.
+    # This prevents the browser from caching the redirect or the login page,
+    # which solves the issue of infinite logout loop.
+    header {
+        # Tell the browser the response depends on the cookie.
+        Vary "Cookie"
+
+        # Prevent all caching.
+        Cache-Control "no-store, no-cache, must-revalidate"
+        Pragma "no-cache"
+        Expires "0"
+    }
+
+
+    # Use `route` for explicit, top-to-bottom order.
+    route {
+        # CORS Policy for SSO Logout.
+        # This allows services to 'fetch' the /logout-all endpoint.
+        
+        # Handle the OPTIONS request.
+        @logout_options {
+            path /logout-all*
+            method OPTIONS
+        } 
+        handle @logout_options {
+            # Add all the necessary CORS "permission" headers.
+            header {
+                Access-Control-Allow-Origin "{http.request.header.Origin}"
+                Access-Control-Allow-Methods "GET, OPTIONS"
+                Access-Control-Allow-Headers "*"
+                # 'true' is often needed when redirects are involved.
+                Access-Control-Allow-Credentials "true"
+                Vary "Origin"
+            }
+
+            # Respond with 200 OK --- universally accepted as "OK status" for
+            # prefilghts.
+            respond 200
+        }
+
+        # Handle the GET request.
+        # SSO Logout Chain Handler.
+        # This handles the actual fetch/redirect for the logout page.
+        @logout_all {
+            path /logout-all*
+        }
+        handle @logout_all {
+            # Add CORS headers to the actual response, so
+            # the fetch API is allowed to read it.
+            header {
+                Access-Control-Allow-Origin "{http.request.header.Origin}"
+                Access-Control-Allow-Credentials "true"
+                Vary "Origin"
+            }
+            
+            # Set the root directory only for this block.
+            root * /etc/caddy
+
+            # Unconditionally rewrite the request to the provided HTML file.
+            rewrite * /logout-all.html
+
+            # Serve the rewritten file.
+            file_server
+        }
+
+        # Matcher for logged-in users at the bare '/' domain.
+        @already_logged_in {
+            path /
+            header_regexp Cookie ds_session=.*
+
+            # The matcher runs only if there is no query string.
+            # This ensure we only match / and NOT /?flow=... or /logout?...
+            # etc.
+            expression "{http.request.uri.query}== ''"
+        }
+
+        # Handle the logged-in case.
+        # (Redirect users if they are logged in.)
+        handle @already_logged_in {
+            redir https://jupyter.{{ parent_domain }}/ 302
+        }
+        
+        # Handle all other cases.
+        handle {
+            reverse_proxy authelia:9091
+        }
+    }
+}
+
+# `jupyter` Subdomain (JupyterHub)
+jupyter.{{ parent_domain }} {
+	import tls
+    import security_headers
+
+    reverse_proxy jupyterhub:8000 {
+        # Disable buffering for WebSockets/Streaming / internal flush interval
+        # to stop Caddy from aborting streaming connections.
+        flush_interval -1
+    }
+}
+
+# `git` Subdomain (Forgejo)
+git.{{ parent_domain }} {
+	import tls
+    import security_headers
+
+    route {
+
+        # Docker Registry API traffic.
+        # This block is tried first.
+        # It specifically matches requests for the Docker v2 API and 
+        # proxies them directly to Forgejo.
+        # Forgejo handles the Basic Authentication from the Docker client.
+        # Authelia is *not* involved for this path.
+        handle /v2/* {
+            reverse_proxy forgejo:3000
+        }
+
+        # Handle preflight (OPTIONS) requests first.
+        # This block is not authenticated by Authelia.
+        # This fixes the "CORS" errors.
+        @preflight {
+            method OPTIONS
+            path /user/logout*
+            header Origin https://auth.{{ parent_domain }}
+        }
+        handle @preflight {
+            # Tell that POST, Credentials, and
+            # specific headers are all allowed.
+            header {
+                Access-Control-Allow-Origin "https://auth.{{ parent_domain }}"
+                Access-Control-Allow-Methods "POST, OPTIONS"
+                Access-Control-Allow-Headers "Content-Type, X-Requested-With"
+                # 'true' is often needed when redirects are involved.
+                Access-Control-Allow-Credentials "true"
+            }
+            respond 204
+        }
+
+        # Handle the `logout-all.html` script's logout POST.
+        @logout_from_script {
+            method POST
+            path /user/logout*
+            #header Origin https://auth.{{ parent_domain }}
+            header X-Requested-With "XMLHttpRequest"
+        }
+        handle @logout_from_script {
+            import authelia
+            reverse_proxy forgejo:3000
+
+            # Manually add the CORS headers to the response.
+            header {
+                Access-Control-Allow-Origin "https://auth.{{ parent_domain }}"
+                Access-Control-Allow-Credentials "true"
+            }
+        }
+
+        # Handle the UI's logout POST.
+        # This is triggered by user logging out of service.
+        @logout_from_ui {
+            method POST
+            path /user/logout*
+            #not header Origin https://auth.{{ parent_domain }}
+            not header X-Requested-With "XMLHttpRequest"
+        }
+        handle @logout_from_ui {
+            import authelia
+
+            reverse_proxy forgejo:3000
+            # This block intentionally does nothing to the response.
+            # It just lets Forgejo respond 200 OK, which then
+            # triggers the browser to call /-/fetch-redirect.
+        }
+
+        # Handle the /-/fetch-redirect POST that comes after a logout.
+        # This request lacks the Forgejo session cookie, 
+        # because /user/logout deletes it.
+        @fetch_redirect_logout {
+            method POST
+            path /-/fetch-redirect*
+
+            # `i_like_gitea` is a Forgejo session cookie name.
+            not header_regexp Cookie .*i_like_gitea=.*
+        }
+        handle @fetch_redirect_logout {
+            # This is the logout redirect.
+            # Send to the central logout page.
+            # 303 See Other is the correct code for 
+            # redirecting a POST to a GET.
+            redir "https://auth.{{ parent_domain }}/logout-all?rd=https://git.{{ parent_domain }}&origin=forgejo" 303
+        }
+
+        # Handle all other /-/fetch-redirect POSTs (e.g., creating an issue).
+        # This request has the Forgejo session cookie.
+        @fetch_redirect_auth {
+            method POST
+            path /-/fetch-redirect*
+
+            # `i_like_gitea` is a Forgejo session cookie name.
+            header_regexp Cookie .*i_like_gitea=.*
+        }
+        handle @fetch_redirect_auth {
+            # This is a normal app action.
+            # Proxy to Forgejo.
+            # This doesn't need `import authelia` because
+            # Authelia's config already bypasses this path.
+            reverse_proxy forgejo:3000
+        }
+
+        # Handle everything else.
+        handle {
+            import authelia
+            reverse_proxy forgejo:3000 {
+                # Disable buffering for WebSockets/Streaming / internal flush
+                # interval to stop Caddy from aborting streaming connections.
+                flush_interval -1
+            }
+        }
+    }
+}
+
+# `monitoring` Subdomain (Grafana)
+monitoring.{{ parent_domain }} {
+	import tls
+    import security_headers
+
+    reverse_proxy grafana:3000 {
+        # Disable buffering for WebSockets/Streaming / internal flush interval
+        # to stop Caddy from aborting streaming connections.
+        flush_interval -1
+    }
+}

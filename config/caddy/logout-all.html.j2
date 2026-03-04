@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Logging Out...</title>
+</head>
+<body>
+    <p>Logging you out of all services, please wait...</p>
+    <script>
+        if (window.self === window.top) {
+
+            // Get all parameters.
+            const url_params = new URL(window.location.href).searchParams;
+
+            // Get the service the user logged out from.
+            const origin_service = url_params.get("origin");
+
+            // Get the final page to land on.
+            const final_redirect = url_params.get("rd") || '/';
+
+            // Define all services in the logout chain.
+            const all_services = [
+                        {
+                                    id: "jupyter", 
+                                    type: "iframe",
+                                    url: "https://jupyter.{{ parent_domain }}/hub/logout"
+                        },
+                        {
+                                    id: "grafana", 
+                                    type: "iframe",
+                                    url: "https://monitoring.{{ parent_domain }}/logout"
+                        },
+                        { 
+                                    id: "forgejo", 
+                                    type: "fetch",
+                                    url: "https://git.{{ parent_domain }}/user/logout"
+                        }
+            ];
+
+            // The Authelia logout URL, which is called at the very end.
+            const authelia_logout_url = "/logout?rd=" + encodeURIComponent(final_redirect);
+
+            // Filter out the service user logged out from.
+            const services_to_logout = all_services.filter(service => service.id !== origin_service);
+
+            // Function to load a logout URL.
+            function logout(service) {
+                        return new Promise((resolve) => {
+                                    console.log("Logging out from " + service.id);
+                                    if (service.type == "iframe") {
+                                        const iframe = document.createElement("iframe");
+                                        iframe.style.display = "none";
+
+                                        // Failsafe: move on after 3 sec.
+                                        const timer = setTimeout(() => {
+                                                    console.warn("Logout time out for: " + service.id); 
+                                                    document.body.appendChild(iframe);
+                                                    resolve();
+                                        }, 3000); // 3-second failsafe
+
+
+                                        // When the iframe finishes loading, resolve
+                                        // the promise.
+                                        iframe.onload = () => {
+                                                    console.log("Logged out from " + service.id);
+                                                    // Clean up.
+                                                    clearTimeout(timer);
+                                                    document.body.removeChild(iframe);
+                                                    resolve();
+                                        };
+
+                                        // If it fails, resolve anyway so the chain
+                                        // isn't stopped.
+                                        iframe.onerror = () => {
+                                                    console.error("Error logging out from " + service.id);
+                                                    // Clean up.
+                                                    clearTimeout(timer);
+                                                    document.body.removeChild(iframe);
+                                                    resolve();
+                                        };
+                                        iframe.src = service.url + "?logout_chain=true";
+                                        document.body.appendChild(iframe);
+
+                                    } else if (service.type == "fetch") {
+                                                fetch(service.url, {
+                                                            method: "POST",
+                                                            credentials: "include",
+                                                            headers: {
+                                                                        "X-Requested-With": "XMLHttpRequest",
+                                                                        "Content-Type": "application/json; charset=utf-8"
+                                                            }
+                                                })
+                                                    .catch(err =>
+                                                                console.error("Logout error for " + service.id, err))
+                                                    .finally(() => resolve()); // Always resolve.
+                                    }
+                        });
+            }
+
+            // Run the logout chain.
+            async function run_logout() {
+                        // Log out of all services (except for origin), one by one.
+                        for (const service of services_to_logout) {
+                                    await logout(service)
+                        }
+
+                        // After all services are done, log out of Authelia.
+                        console.log("All services logged out. Logging out of Authelia...");
+                        window.location.href = authelia_logout_url;
+            }
+
+            run_logout();
+
+        } else {
+                    console.log("Logout script blocked: running inside an inframe (loop detected)");
+        }
+
+    </script>
+</body>
+</html>

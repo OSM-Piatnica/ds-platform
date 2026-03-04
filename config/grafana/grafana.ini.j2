@@ -1,0 +1,49 @@
+# config/grafana/grafana.ini.j2
+
+[server]
+root_url = https://monitoring.{{ parent_domain }}/
+serve_from_sub_path = false
+
+[security]
+# Use the default "admin" for the local emergency user
+# to avoid collision with the "infra_admin" user from OIDC.
+admin_user = admin
+# Allow cookie in cross-stire contexts (required for iframe logout).
+cookie_samesite = none
+cookie_secure = true
+# Allow Grafana to be rendered in the hidden iframe.
+allow_embedding = true
+
+[database]
+type = postgres
+host = postgresql:5432
+name = grafana_db
+user = grafana_user
+
+[auth]
+# Maximum time a user can be inactive before being logged out.
+login_maximum_inactive_lifetime_duration = 1h
+
+[auth.generic_oauth]
+enabled = true
+name = Authelia
+allow_sign_up = true
+auto_login = true
+signout_redirect_url = "https://auth.{{ parent_domain }}/logout-all?rd=https://monitoring.{{ parent_domain }}&origin=grafana"
+client_id = grafana
+scopes = openid profile email groups
+auth_url = https://auth.{{ parent_domain }}/api/oidc/authorization
+token_url = https://auth.{{ parent_domain }}/api/oidc/token
+api_url = https://auth.{{ parent_domain }}/api/oidc/userinfo
+
+client_secret = {{ grafana_oidc_client_secret }}
+
+login_attribute_path = preferred_username
+groups_attribute_path = groups
+name_attribute_path = name
+
+# Force Grafana to re-check token validity.
+token_rotation_interval_minutes = 5
+
+# Map Authelia's OIDC 'admins' group to Grafana's internal 'Admin' role.
+role_attribute_path = contains(groups[*], 'admins') && 'Admin' || 'Editor'

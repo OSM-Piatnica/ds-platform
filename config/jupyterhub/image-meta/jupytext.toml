@@ -1,0 +1,6 @@
+# config/jupyterhub/image-meta/jupytext.toml
+
+# Always pair `.ipynb` notebooks with a python script in 'percent' format.
+# This format allows the script to be edited in text editors / IDEs and run as
+# a notebook.
+formats = "ipynb,py:percent"

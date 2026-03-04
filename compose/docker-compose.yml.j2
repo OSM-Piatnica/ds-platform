@@ -1,0 +1,644 @@
+# compose/docker-compose.yml.j2
+
+# =============================================================================
+# PLATFORM ORCHESTRATION
+# =============================================================================
+# This file defines the entire runtime state of the platform.
+#
+# GENERAL COMMENTS:
+# Pin to the major versions to get security updates, but avoid potential
+# instability of "latest" versions.
+# =============================================================================
+
+services:
+  postgresql:
+    image: postgres:18
+    container_name: postgresql
+    restart: unless-stopped
+    # -------------------------------------------------------------------------
+    # MEMORY & PERFORMANCE TUNING
+    # -------------------------------------------------------------------------
+    # Postgres doesn't automatically respect Docker's 12G memory limit: 
+    # explcitly apply the limits to prevent Linux OOM-killer crashes.
+    command:
+      - "postgres"
+      # shared_buffers: Determines how much memory is dedicated to caching data.
+      # Rule of thumb: Set to ~25% of the container's total memory limit (12G).
+      - "-c"
+      - "shared_buffers=3GB"
+      # work_mem: Memory used for internal sort operations and hash tables 
+      # *per connection*. 32MB is a safe, performant baseline for generic workloads.
+      - "-c"
+      - "work_mem=32MB"
+      # maintenance_work_mem: Memory used for maintenance tasks like VACUUM, 
+      # CREATE INDEX, and ALTER TABLE. Since these are infrequent, 512MB speeds them up.
+      - "-c"
+      - "maintenance_work_mem=512MB"
+      # max_connections: Hard cap on concurrent connections to prevent memory exhaustion.
+      # Covers Authelia, Forgejo, JupyterHub, and Grafana combined.
+      - "-c"
+      - "max_connections=200"
+    # -------------------------------------------------------------------------
+    volumes:
+      # NOTE: PostgreSQL 17's data volume was under `/var/lib/postgresql/data`.
+      # Since version 18, `/var/lib/postgresql` is used as actual bind-mount.
+      - /srv/postgresql_data:/var/lib/postgresql
+      # Initialization script runs only on the first startup if the data dir
+      # is empty. It creates the `authelia`, `forgejo`, `grafana` and
+      # `jupyterhub` DBs.
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+    environment:
+      # This user is for administration only. 
+      # User-facing services use specific users.
+      POSTGRES_USER: postgres_root
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_root_password
+    secrets:
+      - postgres_root_password
+      # Secrets needed by `init-db.sh` to set password for app users.
+      - authelia_db_password
+      - forgejo_db_password
+      - jupyterhub_db_password
+      - grafana_db_password
+    networks:
+      - backend_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres_root"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+        resources:
+            reservations:
+                cpus: "1.0"
+                memory: 4G
+            limits:
+                cpus: "4.0"
+                memory: 12G
+
+  valkey:
+    image: valkey/valkey:9
+    container_name: valkey
+    restart: unless-stopped
+    # -------------------------------------------------------------------------
+    # MEMORY TUNING
+    # -------------------------------------------------------------------------
+    # Valkey needs overhead memory to perform background saves (BGSAVE) and 
+    # handle copy-on-write during those forks. Without this headroom, a sudden 
+    # write spike during a snapshot would trigger an OOM kill.
+    command:
+      - "valkey-server"
+      - "--maxmemory"
+      - "1500mb" # Leaves 500MB of the 2G container limit for overhead
+    environment:
+      VALKEY_PASSWORD_FILE: /run/secrets/valkey_password
+    volumes:
+      - /srv/valkey_data:/data
+    secrets:
+      - valkey_password
+    networks:
+      - backend_network
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a $$(cat /run/secrets/valkey_password) ping | grep PONG"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+        resources:
+            reservations:
+                cpus: "0.25"
+                memory: 512M
+            limits:
+                cpus: "1.0"
+                memory: 2G
+
+  authelia:
+    image: authelia/authelia:4
+    container_name: authelia
+    restart: unless-stopped
+    user: "1000:1000" # Run as standard host user
+    volumes:
+      # NOTE: Authelia is stateless: The `storage` data is offloaded to
+      # Postgres, while `sessions` data is offloaded to Valkey --- the `/data`
+      # directory is thus empty. There is no need for Volume
+      # (`authelia_data:/data`) or Bind (`/srv/authelia_data:/data`) Mount.
+      - ../config/authelia/configuration.yml:/config/configuration.yml
+      - ../config/authelia/users_database.yml:/config/users_database.yml
+    secrets:
+      - authelia_jwt_secret
+      - authelia_session_secret
+      - authelia_db_password
+      - authelia_storage_encryption_key
+      - authelia_oidc_private_key
+      - valkey_password
+      - smtp_password
+      - authelia_oidc_hmac_secret
+      # Client secrets for the services Authelia protects.
+      - forgejo_oidc_client_secret_hash
+      - jupyterhub_oidc_client_secret_hash
+      - grafana_oidc_client_secret_hash
+    networks:
+      # Must communicate with Caddy (frontend) and DB (backend).
+      - frontend_network
+      - backend_network
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9091/api/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+    deploy:
+        resources:
+            reservations:
+                cpus: "0.25"
+                memory: 256M
+            limits:
+                cpus: "1.0"
+                memory: 1G
+
+  forgejo:
+    # LTS: Supported until mid-2026.
+    image: codeberg.org/forgejo/forgejo:11
+    container_name: forgejo
+    restart: unless-stopped
+    ports:
+      # Maps host port 222 to container port 22.
+      # Allows "local-based" Git workflow.
+      - "222:22"
+      # Expose API to localhost for Ansible automation.
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - /srv/forgejo_data:/data
+      - ../config/forgejo/app.ini:/data/gitea/conf/app.ini
+{% if use_custom_certs %}
+      # Mount only when using custom certs.
+      - ../secrets/certs/{{ cert_pem }}:/usr/local/share/ca-certificates/internal-ca.pem
+{% endif %}
+    # Copy the key from read-only secrets to the volume directory,
+    # set strictly required 0600 permissions, and the run the original
+    # entrypoint.
+    # Hard redeployment might lead to "Text file busy" error, when trying to
+    # overwrite the key while Forgejo is trying to read it (possible with
+    # mounts) --- that's why the logic which copies the key into the volume is
+    # the safest way to handle this in Docker.
+    command: >
+        sh -c "
+        mkdir -p /data/ssh &&
+        cp /run/secrets/forgejo_ssh_host_key /data/ssh/ssh_host_ed25519_key &&
+        chmod 600 /data/ssh/ssh_host_ed25519_key &&
+{% if use_custom_certs %}
+        update-ca-certificates &&
+{% endif %}
+        /usr/bin/entrypoint"
+    networks:
+      - frontend_network
+      - backend_network
+    secrets:
+      - forgejo_db_password
+      - smtp_password
+      - forgejo_secret_key
+      - forgejo_internal_token
+      - forgejo_ssh_host_key
+    # -------------------------------------------------------------------------
+    # Split-Horizon DNS / "Hairpinning" Fix
+    # -------------------------------------------------------------------------
+    # Force the container to resolve the authentication domain directly to the
+    # Docker Host's internal gateway IP, rather than the public IP.
+    # This ensures "back-channel" communcation (Container -> Caddy -> Authelia)
+    # remains entirely within the VM's internal network bridge. It prevents
+    # connection failures caused by routers/firewalls that block NAT Loopback
+    # and reduces latency by eliminating network round-trips.
+    # -------------------------------------------------------------------------
+    extra_hosts:
+      - "auth.{{ parent_domain }}:host-gateway"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -s http://localhost:3000/api/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+        resources:
+            reservations:
+                cpus: "0.5"
+                memory: 1G
+            limits:
+                cpus: "2.0"
+                memory: 4G
+    environment:
+      # Go's Garbage Collector (GC) is naturally "lazy" to save CPU cycles. Without `GOMEMLIMIT`, 
+      # the GC might wait too long to clean up memory, causing the container to hit the Docker limit 
+      # and get killed. `GOMEMLIMIT` forces the GC to become aggressive right before hitting that ceiling.
+      GOMEMLIMIT: "3600MiB" # ~90% of the 4G limit (according to best practices)
+
+  jupyterhub:
+    # Custom image built via Ansible.
+    image: jupyterhub-custom:latest # Use explicitly named image.
+    container_name: jupyterhub
+    restart: unless-stopped
+    group_add:
+      # Add Docker GID, to allow talking to the socket `/var/run/docker.sock` without root.
+      # (Current deployment's value to hardcode in case of tests: “994”)
+      - "{{ docker_gid }}"
+    volumes:
+      - /srv/jupyterhub_data/service:/data
+      - ../config/jupyterhub/jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
+      # Mount the Docker socket to allow JupyterHub to spawn sibling
+      # containers (single-user servers) on the Docker host.
+      - /var/run/docker.sock:/var/run/docker.sock
+{% if use_custom_certs %}
+      # Mount only when using custom certs.
+      - ../secrets/certs/{{ cert_pem }}:/etc/jupyterhub/certs/internal-ca.pem:ro
+{% endif %}
+    networks:
+      - frontend_network
+      - backend_network
+    secrets:
+      - jupyterhub_cookie_secret
+      - jupyterhub_oidc_client_secret
+      - jupyterhub_db_password
+      - jupyterhub_crypt_key
+      - infra_admin_pass
+    environment:
+      JUPYTERHUB_COOKIE_SECRET_FILE: /run/secrets/jupyterhub_cookie_secret
+      # OAuthenticator uses this variable.
+      OAUTH_CLIENT_SECRET_FILE: /run/secrets/jupyterhub_oidc_client_secret 
+      # JupyterHub uses this variable for database setup.
+      POSTGRES_PASSWORD_FILE: /run/secrets/jupyterhub_db_password
+      # Variable used by DockerSpawner to find the config path on the host.
+      HUB_HOST_CONFIG_PATH: "{{ project_root }}/config/jupyterhub"
+      # Crypt key for persisting `auth_state`.
+      JUPYTERHUB_CRYPT_KEY_FILE: /run/secrets/jupyterhub_crypt_key
+      # Credentials used during automatic SSH key sync to Forgejo.
+      INFRA_ADMIN_USERNAME: "{{ infra_admin_username }}"
+      INFRA_ADMIN_PASSWORD_FILE: /run/secrets/infra_admin_pass
+    # -------------------------------------------------------------------------
+    # Split-Horizon DNS / "Hairpinning" Fix
+    # -------------------------------------------------------------------------
+    # Force the container to resolve the authentication domain directly to the
+    # Docker Host's internal gateway IP, rather than the public IP.
+    # This ensures "back-channel" communcation (Container -> Caddy -> Authelia)
+    # remains entirely within the VM's internal network bridge. It prevents
+    # connection failures caused by routers/firewalls that block NAT Loopback
+    # and reduces latency by eliminating network round-trips.
+    # -------------------------------------------------------------------------
+    extra_hosts:
+      - "auth.{{ parent_domain }}:host-gateway"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/hub/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+        resources:
+            reservations:
+                cpus: "0.25"
+                memory: 512M
+            limits:
+                cpus: "1.00"
+                memory: 2G
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      # Admin-only, bind to localhost.
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - /srv/prometheus_data:/prometheus
+      - ../config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - backend_network
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle" # Allows hot-reloads
+      - "--web.enable-remote-write-receiver" # Flag to accept writed from Alloy
+      - "--storage.tsdb.retention.time=30d" # Retention policy: storing TIME limit
+      - "--storage.tsdb.retention.size=50GB" # Retention policy: storing SIZE limit
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+        resources:
+            reservations:
+                cpus: "0.50"
+                memory: 2G
+            limits:
+                cpus: "2.00"
+                memory: 8G
+    environment:
+      # Go's Garbage Collector (GC) is naturally "lazy" to save CPU cycles. Without `GOMEMLIMIT`, 
+      # the GC might wait too long to clean up memory, causing the container to hit the Docker limit 
+      # and get killed. `GOMEMLIMIT` forces the GC to become aggressive right before hitting that ceiling.
+      GOMEMLIMIT: "7100MiB" # ~90% of the 8G limit (according to best practices)
+
+  loki:
+    image: grafana/loki:3.5
+    container_name: loki
+    restart: unless-stopped
+    ports:
+      # Admin-only, bind to localhost.
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - /srv/loki_data:/loki
+      - ../config/loki/loki-config.yml:/etc/loki/local-config.yml:ro
+    networks:
+      - backend_network
+    command: -config.file=/etc/loki/local-config.yml
+    #secrets:
+    #  - minio_access_key
+    #  - minio_secret_key
+    #  - minio_endpoint
+    #  - minio_bucket_name
+    #environment:
+    #  MINIO_ACCESS_KEY: /run/secrets/minio_access_key
+    #  MINIO_SECRET_KEY: /run/secrets/minio_secret_key
+    #  MINIO_ENDPOINT: /run/secrets/minio_endpoint
+    #  MINIO_BUCKET_NAME: /run/secrets/minio_bucket_name
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+        resources:
+            reservations:
+                cpus: "0.50"
+                memory: 2G
+            limits:
+                cpus: "2.00"
+                memory: 6G
+    environment:
+      # Go's Garbage Collector (GC) is naturally "lazy" to save CPU cycles. Without `GOMEMLIMIT`, 
+      # the GC might wait too long to clean up memory, causing the container to hit the Docker limit 
+      # and get killed. `GOMEMLIMIT` forces the GC to become aggressive right before hitting that ceiling.
+      GOMEMLIMIT: "5400MiB" # ~90% of the 6G limit (according to best practices)
+
+  alloy:
+    image: grafana/alloy:v1.11.3
+    container_name: alloy
+    restart: unless-stopped
+    ports:
+      # Admin-only, bind to localhost
+      - "127.0.0.1:12345:12345" # Alloy UI
+    volumes:
+      - /srv/alloy_data:/data
+      - ../config/alloy/config.alloy:/etc/alloy/config.alloy:ro
+
+      # MOUNTS FOR HOST METRICS DISCOVERY:
+      # Disk usage monitoring.
+      - /:/rootfs:ro
+      # Network/block device stats.
+      - /sys:/sys:ro
+      # Kernel stats.
+      - /proc:/rootproc:ro
+      # Disk metadata.
+      - /run/udev/data:/run/udev/data:ro
+      # Required for Systemd collector to see service states.
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
+      # Physical disk devices. Not needed for virtualized hardware (?)
+      #- /dev/disk:/dev/disk:ro
+      
+      # Needed for (Journald) host system logs discovery.
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+
+      # Needed for (Docker) container metrics and logs discovery.
+      - /var/run:/var/run:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Docker daemon mount.
+      - /etc/docker/daemon.json:/etc/docker/daemon.json:ro
+
+    devices:
+      # Fix issue with permissions for OOM metrics.
+      # Allows kernel message buffer access.
+      - /dev/kmsg:/dev/kmsg 
+    cap_add:
+      - SYSLOG
+      - SYS_TIME # Required for accurate time drift metrics.
+    networks:
+      - backend_network
+    command:
+      - "run"
+      - "/etc/alloy/config.alloy"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+      - "--storage.path=/data"
+    # Privilege Escalation: 
+    # Required for reading kernel logs and full host metrics.
+    security_opt:
+      - apparmor:unconfined
+    pid: "host" # Often required for full process/container discovery.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    deploy:
+        resources:
+            reservations:
+                cpus: "0.25"
+                memory: 512M
+            limits:
+                cpus: "1.00"
+                memory: 2G
+    environment:
+      # Go's Garbage Collector (GC) is naturally "lazy" to save CPU cycles. Without `GOMEMLIMIT`, 
+      # the GC might wait too long to clean up memory, causing the container to hit the Docker limit 
+      # and get killed. `GOMEMLIMIT` forces the GC to become aggressive right before hitting that ceiling.
+      GOMEMLIMIT: "1800MiB" # ~90% of the 2G limit (according to best practices)
+
+  grafana:
+    image: grafana/grafana:12.2
+    container_name: grafana
+    restart: unless-stopped
+    volumes:
+      - /srv/grafana_data:/var/lib/grafana
+      - ../config/grafana/grafana.ini:/etc/grafana/grafana.ini
+      - ../config/grafana/provisioning:/etc/grafana/provisioning
+{% if use_custom_certs %}
+      # Mount only when using custom certs.
+      - ../secrets/certs/{{ cert_pem }}:/etc/ssl/certs/internal-ca.pem
+{% endif %}
+    networks:
+      - frontend_network
+      - backend_network
+    secrets:
+      - infra_admin_pass
+      - grafana_oidc_client_secret
+      - grafana_db_password
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/infra_admin_pass
+      GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET__FILE: /run/secrets/grafana_oidc_client_secret
+      GF_DATABASE_PASSWORD__FILE: /run/secrets/grafana_db_password
+    # -------------------------------------------------------------------------
+    # Split-Horizon DNS / "Hairpinning" Fix
+    # -------------------------------------------------------------------------
+    # Force the container to resolve the authentication domain directly to the
+    # Docker Host's internal gateway IP, rather than the public IP.
+    # This ensures "back-channel" communcation (Container -> Caddy -> Authelia)
+    # remains entirely within the VM's internal network bridge. It prevents
+    # connection failures caused by routers/firewalls that block NAT Loopback
+    # and reduces latency by eliminating network round-trips.
+    # -------------------------------------------------------------------------
+    extra_hosts:
+      - "auth.{{ parent_domain }}:host-gateway"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+        resources:
+            reservations:
+                cpus: "0.50"
+                memory: 2G
+            limits:
+                cpus: "2.00"
+                memory: 8G
+
+  caddy:
+    image: caddy:2
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../config/caddy/Caddyfile:/etc/caddy/Caddyfile
+      - ../config/caddy/logout-all.html:/etc/caddy/logout-all.html
+      - caddy_data:/data
+{% if use_custom_certs %}
+      # Mount only when using custom certs.
+      - ../secrets/certs:/etc/caddy/certs
+{% endif %}
+    networks:
+      - frontend_network
+    depends_on:
+      authelia:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:2019/config/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+        resources:
+            reservations:
+                cpus: "0.50"
+                memory: 256M
+            limits:
+                cpus: "2.00"
+                memory: 1G
+
+secrets:
+  authelia_jwt_secret:
+    file: ../secrets/authelia_jwt_secret.txt
+  authelia_session_secret:
+    file: ../secrets/authelia_session_secret.txt
+  authelia_storage_encryption_key:
+    file: ../secrets/authelia_storage_encryption_key.txt
+  authelia_oidc_private_key:
+    file: ../secrets/authelia_oidc_private_key.txt
+  postgres_root_password:
+    file: ../secrets/postgres_root_password.txt
+  authelia_db_password:
+    file: ../secrets/authelia_db_password.txt
+  forgejo_db_password:
+    file: ../secrets/forgejo_db_password.txt
+  jupyterhub_db_password:
+    file: ../secrets/jupyterhub_db_password.txt
+  grafana_db_password:
+    file: ../secrets/grafana_db_password.txt
+  valkey_password:
+    file: ../secrets/valkey_password.txt
+  smtp_password:
+    file: ../secrets/smtp_password.txt
+  authelia_oidc_hmac_secret:
+    file: ../secrets/authelia_oidc_hmac_secret.txt
+  jupyterhub_oidc_client_secret:
+    file: ../secrets/jupyterhub_oidc_client_secret.txt
+  jupyterhub_oidc_client_secret_hash:
+    file: ../secrets/jupyterhub_oidc_client_secret_hash.txt
+  jupyterhub_cookie_secret:
+    file: ../secrets/jupyterhub_cookie_secret.txt
+  jupyterhub_crypt_key:
+    file: ../secrets/jupyterhub_crypt_key.txt
+  forgejo_oidc_client_secret:
+    file: ../secrets/forgejo_oidc_client_secret.txt
+  forgejo_oidc_client_secret_hash:
+    file: ../secrets/forgejo_oidc_client_secret_hash.txt
+  forgejo_secret_key:
+    file: ../secrets/forgejo_secret_key.txt
+  forgejo_internal_token:
+    file: ../secrets/forgejo_internal_token.txt
+  grafana_oidc_client_secret:
+    file: ../secrets/grafana_oidc_client_secret.txt
+  grafana_oidc_client_secret_hash:
+    file: ../secrets/grafana_oidc_client_secret_hash.txt
+  #minio_access_key:
+  #  file: ../secrets/minio_access_key.txt
+  #minio_secret_key:
+  #  file: ../secrets/minio_secret_key.txt
+  #minio_endpoint:
+  #  file: ../secrets/minio_endpoint.txt
+  #minio_bucket_name:
+  #  file: ../secrets/minio_bucket_name.txt
+  ms_teams_webhook_url:
+    file: ../secrets/ms_teams_webhook_url.txt
+  infra_admin_pass:
+    file: ../secrets/infra_admin_pass.txt
+  forgejo_ssh_host_key:
+    file: ../secrets/forgejo_ssh_host_key
+
+# Volume Mounts
+volumes:
+  caddy_data:
+# Bind Mounts
+# Data which --- for persistance ---  is mounted 
+# under `/srv/` directory on host, instead:
+# valkey_data:
+# postgresql_data
+# forgejo_data
+# alloy_data
+# grafana_data
+# This is for data of JupyterHub container itself. The project containers' data isbind mounted, in `../config/jupyterhub/jupyterhub_config.py` config file.
+# jupyterhub_data/service
+# This is for user's project data, bind mounted in
+# `../config/jupyterhub/jupyterhub_config.py` config file, instead of compose.
+# jupyterhub_data/users 
+# loki_data
+# prometheus_data
+
+
+networks:
+  # For user-facing services.
+  frontend_network:
+    driver: bridge
+    name: ds-frontend-net
+  # For backend services.
+  backend_network:
+    driver: bridge
+    name: ds-backend-net

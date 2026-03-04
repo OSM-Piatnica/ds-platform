@@ -1,0 +1,65 @@
+# config/images/universal_Dockerfile.j2
+
+# syntax=docker/dockerfile:1
+
+# Argument/variable declaration.
+# Declaration has to occur early, otherwise it will lead to error.
+ARG REGISTRY="git.{{ parent_domain }}"
+ARG OWNER="{{ infra_admin_username }}"
+# Use the parent's key (`item.parent`) to look up its name from
+# the `jupyter_images` dict.
+# For example, reaching the iteration of `basic` image, we get:
+# item.parent = "base"
+# jupyter_images["base"].name = "base_image"
+ARG IMAGE="{{ jupyter_images[item.parent].name }}:latest"
+
+# Start from already-built image. 
+# (This inherits the slim OS, user setup, entrypoint, and all Python packages
+# from the base layer.)
+FROM ${REGISTRY}/${OWNER}/${IMAGE}
+
+# Borrow the uv binaries from Astral's official image.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Install packages system-wide.
+# More precisely:
+#   Use whole system as a project environment,
+#   by setting project path to the prefix of the Python installation,
+#   which on Debian-based systems is `/usr/local/`.
+ENV UV_PROJECT_ENVIRONMENT=/usr/local
+
+# Compile `.pyc` files for faster application startup.
+ENV UV_COMPILE_BYTECODE=1
+
+# Increase timeout because of problems during dependency resolution.
+ENV UV_HTTP_TIMEOUT=300
+
+# Always copy files in the containerized environment, suppressing `uv`'s
+# hardlinking warning.
+ENV UV_LINK_MODE=copy
+
+# ============================================================================
+# EPHEMERAL BUILD STEP
+# 1. Temporarily install `build-essential` (which includes `g++`, `gcc`,
+# `make).
+# 2. Run `uv sync` (intelligently installs only the delta, compiling if
+# needed).
+# 3. Purge the compilers to keep the final image completely slim and *secure*:
+# leaving compilers in user-facing, network-connected runtime environment is a
+# well-known security anti-pattern --- it allows compilation of exploits,
+# native payloads, or privilege escalation tools directly inside the
+# compromised container.
+# ============================================================================
+# Use BuildKit's cache mount to speed up dependency installation across builds.
+# This cache is persisted on the Docker host, not in the image.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && uv sync \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set permissions for the directories which `uv` uses when installing packages
+# (system-wide), to ensure the user can install the packages on their own at
+# runtime.
+RUN chown -R jovyan:users /usr/local/*

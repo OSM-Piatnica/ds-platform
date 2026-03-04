@@ -1,0 +1,307 @@
+# DS Platform User Guide
+
+Welcome to the Data Science Platform! 
+
+This platform provides a standardized, reproducible, and scalable environment for data science projects. It integrates **JupyterHub** (workspaces), **Forgejo** (Git version control), and **Grafana** (monitoring) into a cohesive workflow.
+
+## Quick Links
+* **JupyterHub (Workspace):** [https://jupyter.{{ parent_domain }}](https://jupyter.{{ parent_domain }})
+* **Forgejo (Git):** [https://git.{{ parent_domain }}](https://git.{{ parent_domain }})
+* **Grafana (Monitoring):** [https://monitoring.{{ parent_domain }}](https://monitoring.{{ parent_domain }})
+
+---
+
+## Table of Contents
+
+- [1. First-Time Setup: Git](#1-first-time-setup-git)
+  - [1.1 "Zero-Touch" JupyterHub Setup](#11-zero-touch-jupyterhub-setup)
+  - [1.2 Local Machine](#12-local-machine)
+- [2. Workspace Management (JupyterHub)](#2-workspace-management-jupyterhub)
+  - [2.1 Default vs. Named Servers](#21-default-vs-named-servers)
+  - [2.2 Server Types & Images](#22-server-types--images)
+  - [2.3 The Standard Workflow](#23-the-standard-workflow)
+  - [2.4 Stopping and Resuming](#24-stopping-and-resuming)
+  - [2.5 Data Persistence & The "Shared Home"](#25-data-persistence--the-shared-home)
+  - [2.6 Deleting a Project (CRITICAL)](#26-deleting-a-project-critical)
+  - [2.7 Resource Limits & Shared Memory](#27-resource-limits--shared-memory)
+- [3. Development Best Practices](#3-development-best-practices)
+  - [3.1 Package Management with `uv`](#31-package-management-with-uv)
+  - [3.2 Git Workflow & Push-to-Create](#32-git-workflow--push-to-create)
+  - [3.3 Project Hygiene & Security (.gitignore)](#33-project-hygiene--security-gitignore)
+  - [3.4 Clean Version Control (Jupytext)](#34-clean-version-control-jupytext)
+  - [3.5 JupyterLab Extensions](#35-jupyterlab-extensions)
+- [4. Collaboration](#4-collaboration)
+  - [4.1 Asynchronous (Git)](#41-asynchronous-git)
+  - [4.2 Real-Time Collaboration (RTC)](#42-real-time-collaboration-rtc)
+- [5. Monitoring & Observability](#5-monitoring--observability)
+  - [5.1 Dashboards](#51-dashboards)
+  - [5.2 Logs](#52-logs)
+  - [5.3 Alerts](#53-alerts)
+- [6. Troubleshooting](#6-troubleshooting)
+
+---
+
+## 1. First-Time Setup: Git
+    
+### 1.1 "Zero-Touch" JupyterHub Setup
+
+You **do not** need to configure Git inside your JupyterHub workspace. The platform automates this for you when you start a server:
+
+1. **Git Identity Configuration:** Your Name and Email are automatically injected from your login session.
+2. **SSH Key Sync:** An `ed25519` SSH key is generated and automatically uploaded to your Forgejo account: you can interact with the repositories from inside JupyterLab immediately.
+
+### 1.2 Local Machine
+
+To interact with the platform's Git repositories from your local machine (e.g., your laptop), you need to configure your SSH keys and ports correctly.
+
+For this, use the automated script:
+1.  **Download the script**: [setup_local_git_access.py](setup_local_git_access.py) *(Click the file link, then download raw file)*.
+2.  **Run the script**: Open your local terminal/PowerShell and run:
+    ```bash
+    python3 setup_local_git_access.py
+    ```
+    *This script generates an SSH key (if missing), configures your local SSH client to use the platform's custom port (222), and guides you through adding the key to Forgejo.*
+
+---
+
+## 2. Workspace Management (JupyterHub)
+
+The platform uses **Named Servers** to isolate projects. Each server runs in its own Docker container with persistent storage.
+
+### 2.1 Default vs. Named Servers
+
+* **Default Server:** Use this *only* for quick testing, scratchpad work, or "sandboxing." It cannot be renamed and is not tied to a specific project identity.
+* **Named Servers (Recommended):** Use these for actual projects. You give the server a name, and a dedicated project directory is created for it. This allows you to have multiple projects with different resource states running or stopped independently.
+
+### 2.2 Server Types & Images
+
+When creating a server, you must choose a Docker image. Your choice depends on your workflow. Images are built hierarchically (e.g., *Classical ML* includes everything in *Big Data* and *Basic Data Analysis*).
+
+#### The CPU Ecosystem
+
+| Image Name | Key Libraries | Best For |
+| :--- | :--- | :--- |
+| **Base** | Minimal Python + `uv` + `git`. | **Reproducibility.** Start here, clone repo, and run `uv sync` to replicate a project environment. |
+| **Basic Data Analysis [CPU]** | NumPy, Pandas, Matplotlib, Plotly, DuckDB, Polars, S3fs, SQLAlchemy. | **Exploratory Analysis.** Ad-hoc tasks, database/S3 connections, rapid prototyping and visualization. |
+| **Big Data [CPU]** | Dask. | **Scaling Pandas.** Parallelizing tabular data operations across CPU cores. |
+| **Classical ML [CPU]** | SciPy, Scikit-Learn, XGBoost, LightGBM, CatBoost, UMAP, Optuna. | **Modeling.** Classical ML piplines: training algorithms, dimensionality reduction, hyperparameter optimization. |
+| **Optimization [CPU]** | OR-Tools, Gekko, CVXPY. | **Mathematical Optimization and OR.** Linear and non-linear programming, constraint programming, convex optimization. |
+| **Time-Series [CPU]** | Nixtla Stack, sktime, DARTS, Prophet. | **Analysis and Forecasting.** Working with Times-Series data, e.g., anomaly detection. |
+| **Geospatial Toolkit [CPU]** | GeoPandas, Rasterio, OSMnx, Lonboard. | **GIS.** Spatial operations, parallelized geoprocessing, and interactive mapping. |
+| **Deep Learning Base [CPU]** | PyTorch (CPU-only). | **Neural Networks.** Writing and testing PyTorch pipelines locally without GPU overhead. |
+| **Deep Learning: CV [CPU]** | Scikit-Image, Pillow, timm, roboflow's supervision. | **CV Pipelines.** Image processing, and applying state-of-the-art pre-trained vision models on the CPU. |
+| **Deep Learning: NLP [CPU]** | SpaCy, NLTK, Hugging Face stack (transformers, tokenizers, datasets), Sentence Transformers. | **NLP Pipelines.** Text processing, parsing, tokenization, and applying pre-trained NLP models or generating vector embeddings on the CPU. |
+
+
+#### The GPU Ecosystem
+Requires a GPU-enabled host. **Selecting one of these images automatically requests and mounts the host's NVIDIA GPUs into your container.**
+
+| Image Name | Key Libraries (not already listed) | Best For |
+| :--- | :--- | :--- |
+| **Basic Data Analysis [GPU]** | CUDA 13 (GPU Core Dependency), GPU-accelerated Polars. | **Basic GPU-accelerated Analysis.** Exploratory analysis requiring base GPU access and CUDA compilation without heavy ML libraries. |
+| **Big Data [GPU]** | RAPIDS Stack (cuDF, Dask-cuDF, rmm). | **Massive DataFrames.** Blazing fast parallel tabular operations and highly efficient memory pooling on the GPU. |
+| **Classical ML [GPU]** | RAPIDS cuML. | **Accelerated Modeling.** Offloading Classical ML algorithms (including Gradient Boosting) to the GPU. |
+| **Optimization [GPU]** | CPU Stack. | **Operations Research.** Linear and non-linear programming, constraint programming, convex optimization. |
+| **Time-Series [GPU]** | CPU Stack. | **Analysis and Forecasting.** Working with Times-Series data, e.g., anomaly detection, or hierarchical forecasting. |
+| **Geospatial Toolkit [GPU]** | CPU Stack. | **GIS.** Spatial operations and fast interactive vector data visualization leveraging GeoArrow. |
+| **Deep Learning Base [GPU]** | PyTorch (CUDA 13). | **Custom Neural Networks.** Full scale tensor computing. |
+| **Deep Learning: CV [GPU]** | NVIDIA DALI, Kornia. | **Advanced CV Pipelines and Vision Transformers.** Reduction of training and inference times for image processing by GPU-parallelization of matrix operations. Includes NVIDIA DALI to bypass CPU bottlenecks by decoding images directly on the GPU, and Kornia for differentiable, tensor-based image augmentations. |
+| **Deep Learning: NLP [GPU]** | GPU-accelerated SpaCy, accelerate, PEFT, vLLM. | **Advanced NLP Pipelines and LLMs.** GPU-accelerated increase of compute and memory bandwidth for attention mechanisms and autoregressive generation. Provied GPU-accelerated SpaCy, accelerate for mixed-precision execution, PeFT for parameter-efficient fine-tuning (LoRA/QLoRA), and vLLM for high-throughput LLM serving (utilizing PagedAttention). |
+
+### 2.3 The Standard Workflow
+
+#### Scenario A: The New Project
+*You want to create a new project from scratch.*
+
+1.  **Spawn:** Go to the JupyterHub Home. Under "Named Servers", enter a project name (e.g., `forecasting-v1`) and click **Add New Server**. 
+2.  **Select Image:** Select your desired image (e.g., *Basic Data Analysis*).
+3.  **Work:** The environment comes pre-loaded with standard libraries: you can immediately import libraries (e.g., `pandas`). Develop your code, run notebooks, and save files. Your work is saved automatically to the persistent volume.
+
+#### Scenario B: The Existing Project
+*You want to continue work on an existing project whose data is currently stored in the repo, or asynchronously collaborate on a team project.*
+
+1.  **Spawn:** Create a Named Server (e.g., `credit-scoring-model`).
+2.  **Select Image:** Choose the **Base** image.
+    * *Why?* The "feature-full" images might contain versions of packages that conflict with your project's requirements. Starting empty ensures reproducibility.
+3.  **Clone:** Open a Terminal in JupyterLab and clone your repository:
+    ```bash
+    git clone git@git.{{ parent_domain }}:team/<project_name>.git
+    cd <project_name>
+    ```
+4.  **Sync:** Install the exact dependencies defined in the project's lockfile:
+    ```bash
+    uv sync
+    ```
+    *Note: `uv` is configured to install packages directly into the container's system environment. You do not need to activate a virtual environment.*
+    *Reminder: For `uv sync` to work correctly in this scenario, ensure that whoever initially created the project committed  the `pyproject.toml` and `uv.lock` files to the Forgejo repository.*
+
+### 2.4 Stopping and Resuming   
+1.  **Stop:** When you finish work for the day, go to **File -> Hub Control Panel** and click **Stop** next to your server.
+    * *Note:* Stopping a server releases CPU/RAM resources back to the pool but preserves your files and installed packages.
+2.  **Resume:** Next time, simply click **Start** next to the server name in the Control Panel. Your environment will resume exactly where you left the file system.
+    
+### 2.5 Data Persistence & The "Shared Home"
+
+It is important to understand how your files are stored. While Named Servers provide isolated *compute* environments (CPU/RAM), they share a single **Persistent Storage Volume**.
+
+* **The Structure:** When you start a server, the system mounts your personal data volume to `/home/jovyan` inside the container.
+    * The system then creates a subdirectory for your specific project (e.g., `/home/jovyan/project-alpha`) and sets it as your working directory.
+    * This means that if you navigate "up" one level (`cd ..`), you will see the directories of your other projects (e.g., `/home/jovyan/project-beta`).
+* **The Benefit (Shared Configs):** Because the "root" of your home directory (`/home/jovyan`) persists across all your projects, configuration files stored there are shared globally.
+    * **SSH Keys:** The keys generated in `.ssh/` are available to *all* your named servers. You don't need to re-authenticate with Git for every new project.
+    * **Package Cache:** The `uv` cache is stored in `.cache/uv`. When you install a library like `pandas` in Project A, `uv` caches it. If you later start Project B and need `pandas`, `uv` will "install" it instantly from the local cache without downloading it again.
+* **The Caution:** Since the storage is shared, **be careful when deleting files via the terminal**. If you are in the root `/home/jovyan` and run a recursive delete, you could accidentally wipe data from *other* projects. Always ensure you are inside the correct project folder before running cleanup scripts like `./del_proj_dir.sh`.
+    
+### 2.6 Deleting a Project (CRITICAL)
+If a project is finished and needs to be removed, follow this specific order to prevent leaving "orphaned data" on the disk:
+
+1.  **Commit & Push:** Ensure all your work is pushed to Forgejo. **Deletion is permanent.**
+2.  **Run Deletion Script:** Inside the running server, open a Terminal and run:
+    ```bash
+    ./del_proj_dir.sh
+    ```
+    *Type `y` to confirm. This physically deletes the project files from the server's disk.*
+3.  **Delete Server:** Go to **File -> Hub Control Panel** and click **Delete** next to the server.
+    * *Why this order?* If you delete the server in the UI first, you lose access to the container. In other words, the files become "orphaned" on the disk and require either recreation of the server with the same exact name to access the files again, or administrator intervention to clean up.
+    
+### 2.7 Resource Limits & Shared Memory
+
+To ensure fair usage and stability, each Named Server container is subject to strict hardware limits.
+
+*  **CPU:** Up to **4.0 vCPUs**.
+*  **RAM:** Up to **16 GB**. (The container will be killed if this is exceeded).
+*  **Shared Memory (`/dev/shm`):** **2 GB**.
+
+**Why Shared Memory Matters (Deep Learning)**
+Standard Docker containers default to only 64MB of shared memory. This is insufficient for modern Data Science workflows. Deep Learning libraries like **PyTorch** use Shared Memory to parallelize data loading (e.g., `DataLoader(..., num_workers=4)`). If this space fills up, your training script will crash immediately with a **"Bus error"**. We explicitly increase this limit to **2 GB** to support standard training workflows.
+
+**GPU VRAM Sharing Notice**
+If you launch a `[GPU]` designated image, your container is granted access to **all available NVIDIA GPUs** on the host machine. 
+* **Shared Resource:** Because this is a shared environment, you are sharing the GPU's Video RAM (VRAM) with your colleagues. 
+* **Out-Of-Memory (OOM):** If you attempt to load a massive Large Language Model (LLM) into VRAM while a colleague is running a heavy PyTorch training job, you may encounter CUDA Out-Of-Memory errors. Please coordinate with your team when running exceptionally heavy GPU workloads.
+
+---
+
+## 3. Development Best Practices
+
+### 3.1 Package Management with `uv`
+
+We use **[uv](https://github.com/astral-sh/uv)** for high-speed, modern dependency management.
+
+**Do not use `pip install` (or `conda install`).**
+
+* **Where to run it:** Always run `uv` commands in the **Terminal**, not inside Notebook cells ( `!uv add ...`).
+    * *Reasoning:* Running installation commands in notebooks makes them non-reproducible. If you install a package in a cell, you might forget to document it. Using the Terminal encourages you to manage dependencies explicitly.
+* **Installing Packages:**
+    ```bash
+    # Add a new package to your environment
+    uv add <package_name>
+    ```
+    *Note: The system environment is unlocked for you. You do not need to activate a virtual environment.*
+    
+#### Common Commands
+
+| Goal | Command |
+| :--- | :--- |
+| **Add a package** | `uv add pandas` (Adds to `pyproject.toml` and installs) |
+| **Add a dev tool** | `uv add --dev pytest` (Adds to dev-dependencies) |
+| **Install from lockfile** | `uv sync` (Restores environment from `uv.lock`) |
+
+### 3.2 Git Workflow & Push-to-Create
+You can create repositories on Forgejo directly from your JupyterLab terminal.
+
+1.  **Initialize:**
+    ```bash
+    git init
+    ```
+2.  **Add Remote:** (You can point to a repo that doesn't exist yet!)
+    ```bash
+    git remote add origin git@git.{{ parent_domain }}:<your_username>/<project_name>.git
+    ```
+    *Note: Thanks to the `setup_local_git_access.py` script, this exact URL works seamlessly both inside your JupyterHub terminal and on your local laptop. You do not need to manually specify the custom SSH port (222) locally.*
+3.  **Push:**
+    ```bash
+    git add .
+    git commit -m "Initial commit"
+    git push -u origin main
+    ```
+    *Forgejo will automatically create the repository for you.*
+
+### 3.3 Project Hygiene & Security (.gitignore)
+
+To keep your repositories clean and secure, the platform automatically injects a standard `.gitignore` file into every new project.
+
+* **Unified Workflow:** This configuration is designed to support both your **JupyterHub** workspace and your **Local Machine**.
+    * **On JupyterHub:** It ignores platform-specific scripts (`del_proj_dir.sh`) and Jupyter backups (`.ipynb_checkpoints`).
+    * **Locally:** It ignores common editor configurations (like `.vscode/` or `.idea/`) and local virtual environments (`.venv/`), ensuring your repository remains clean regardless of where you work.
+
+* **What Else it Blocks:**
+    * **Secrets:** Configuration files like `.env` that might contain API keys.
+    * **System Junk:** Python caches (`__pycache__`) and build artifacts.
+    * **Large Data:** Directories named `data/`, `outputs/`, or `models/`.
+        * *Best Practice:* Git is not designed for large binary files. Store your heavy datasets and model weights in these specific folders to keep your repository lightweight and fast.
+    
+### 3.4 Clean Version Control (Jupytext)
+Jupyter Notebooks are powerful for analysis but notoriously difficult to version control (Git sees them as messy JSON files, making code review painful).
+
+* **Auto-Pairing:** Your project directories are pre-configured with **Jupytext**. Every time you save a notebook (e.g., `analysis.ipynb`), a clean Python script version (e.g., `analysis.py`) is automatically created or updated in the same directory.
+* **The Workflow:**
+    1.  Work in your notebook and save as usual.
+    2.  When you run `git status`, you will see that both the `.ipynb` and `.py` files have changed.
+    3.  **Best Practice: Commit both files.**
+* **Why?**
+    * **For Review:** When checking Pull Requests on Forgejo, look at the `.py` file. It shows a clean, line-by-line diff of your code logic without the noise of metadata or base64-encoded images.
+    * **For History:** The `.ipynb` file is committed to preserve your plots, charts, and cell outputs for future reference.
+
+### 3.5 JupyterLab Extensions
+You can customize the behavior of installed extensions via **Settings -> Settings Editor**. This is persistent across sessions.
+
+---
+
+## 4. Collaboration
+
+### 4.1 Asynchronous (Git)
+This is the primary method for collaboration. Push your code to Forgejo and use Pull Requests / Issues to review code.
+
+### 4.2 Real-Time Collaboration (RTC)
+JupyterLab RTC allows simultaneous, real-time editing in the same notebook.
+
+#### Important Rules
+1.  **Sporadic Sharing:** RTC is enabled on your personal servers. You *can* share the URL of your active server with a colleague for a quick look. However, **do not** use your personal server for long-term team projects.
+2.  **Collaborative Accounts:** For sustained team work, use the shared `collab-project` account.
+
+#### How to use the Collaborative Account
+1.  **Access Admin Panel:** In JupyterHub, click **Admin** in the top navigation bar.
+2.  **Manage the User:** Find the user named `collab-project`.
+3.  **Start Server:**
+    * If the server is stopped, click **Start Server**.
+    * *Note:* You can only spawn the **Default Server** for the collaborative account via this UI. Spawning **Named Server** requires logging into the collaborative account. 
+4.  **Access:** Once started, click **Access Server**. You will be redirected to the shared workspace. Multiple users can join this workspace simultaneously.
+5.  **Stop:** When the collaboration session is over, return to the Admin panel and **Stop** the server to free up resources.
+
+---
+
+## 5. Monitoring & Observability
+
+Access Grafana at [https://monitoring.{{ parent_domain }}](https://monitoring.{{ parent_domain }}).
+
+### 5.1 Dashboards
+* **Provisioned Dashboards:** You will see ready-made dashboards.
+    * *Note:* These dashboards are **Read-Only** (provisioned as code). If you need to edit one, open it, click "Settings" (gear icon), and **Save As...** a new JSON file to create your own editable copy.
+
+### 5.2 Logs
+* **Loki:** Use the **Drilldown** tab in Grafana. Select **Logs**.
+
+### 5.3 Alerts
+* **Grafana Alerting:** The platform monitors for high resource usage. If the host machine exceeds **85% CPU or Memory**, an alert is sent to the **MS Teams** chat. If you see a notification, please check whether your running processes aren't hanging or optimizing poorly.
+
+---
+
+## 6. Troubleshooting
+
+* **"Server failed to start"**: You may have hit your resource limits (CPU/RAM). Stop unused Named Servers in the Control Panel.
+* **"Permission denied" in Terminal**: Ensure you are working inside `/home/jovyan/<project_name>`.
+* **Git Authentication Fails:** Verify you ran the `setup_local_git_access.py` script on your local machine and that your SSH key is added to your Forgejo profile.
+* **Missing Packages**: If `import` fails, run `uv sync` to ensure your environment matches the `uv.lock` file.
+* **Kernel dies repeatedly ("Kernel Restarting...")**: Check if you aren't hitting the memory limit.
+* **"Bus error" crashes while training**: Reduce the `num_workers` parameter in your data loader (set `num_workers=0` to debug), or check if you are caching huge tensors in memory unnecessarily.

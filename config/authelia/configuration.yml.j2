@@ -1,0 +1,119 @@
+# config/authelia/configuration.yml.j2
+
+server:
+  address: tcp://0.0.0.0:9091/
+  
+session:
+  name: ds_session
+  secret: "{{ authelia_session_secret }}"
+  cookies:
+    - domain: "{{ parent_domain }}"
+      authelia_url: "https://auth.{{ parent_domain }}"
+      default_redirection_url: "https://jupyter.{{ parent_domain }}"
+  redis:
+    host: valkey
+    port: 6379
+    password: "{{ valkey_password }}"
+  # The time a user can remain inactive before being logged out.
+  inactivity: "1h"
+
+authentication_backend:
+  password_reset:
+    disable: true
+  file:
+    path: /config/users_database.yml
+    password:
+      algorithm: argon2id
+      iterations: 3
+      salt_length: 16
+      parallelism: 4
+      memory: 65536
+
+access_control:
+  default_policy: deny
+  rules:
+    # Allow authenticated users to access all subdomains
+    - domain: "*.{{ parent_domain }}"
+      policy: one_factor
+    - domain: "git.{{ parent_domain }}"
+      policy: "bypass"
+      methods: ["POST"]
+      resources: 
+        - "^/-/fetch-redirect.*$"
+
+storage:
+  encryption_key: "{{ authelia_storage_encryption_key }}"
+  postgres:
+    address: tcp://postgresql:5432
+    database: authelia_db
+    username: authelia_user
+    password: "{{ authelia_db_password }}"
+
+notifier:
+  smtp:
+    address: "submission://{{ smtp_host }}:{{ smtp_port }}"
+    username: "{{ smtp_username }}"
+    password: "{{ smtp_password }}"
+    sender: "{{ smtp_sender }}"
+    tls:
+      server_name: "{{ smtp_host }}"
+
+identity_providers:
+  oidc:
+    hmac_secret: "{{ authelia_oidc_hmac_secret }}"
+    jwks:
+      - algorithm: RS256
+        use: sig
+        key: |
+          {{ authelia_oidc_private_key | indent(10) }}
+    # Authelia's Escape Hatch Configuration for Grafana
+    claims_policies:
+        grafana:
+            id_token: ["email", "name", "groups", "preferred_username"]
+    clients:
+      - client_id: forgejo
+        client_name: Forgejo
+        client_secret: "{{ forgejo_oidc_client_secret_hash }}"
+        public: false
+        authorization_policy: one_factor
+        redirect_uris:
+          - "https://git.{{ parent_domain }}/user/oauth2/authelia/callback"
+        scopes:
+          - openid
+          - profile
+          - email
+          - groups
+        token_endpoint_auth_method: client_secret_basic
+        # Bypass consent screen.
+        consent_mode: implicit
+      - client_id: jupyterhub
+        client_name: JupyterHub
+        client_secret: "{{ jupyterhub_oidc_client_secret_hash }}"
+        public: false
+        authorization_policy: one_factor
+        redirect_uris:
+          - "https://jupyter.{{ parent_domain }}/hub/oauth_callback"
+        scopes:
+          - openid
+          - profile
+          - email
+          - groups
+        token_endpoint_auth_method: client_secret_post
+        # Bypass consent screen.
+        consent_mode: implicit
+      - client_id: grafana
+        claims_policy: grafana # Load Escape Hatch Configuration
+        client_name: Grafana
+        client_secret: "{{ grafana_oidc_client_secret_hash }}"
+        public: false
+        authorization_policy: one_factor
+        redirect_uris:
+          - "https://monitoring.{{ parent_domain }}/login/generic_oauth"
+        scopes:
+          - openid
+          - profile
+          - email
+          - groups
+        token_endpoint_auth_method: client_secret_basic
+        # Bypass consent screen.
+        consent_mode: implicit

@@ -1,0 +1,44 @@
+# config/images/universal_pyproject.toml.j2
+
+[project]
+name = "{{ item.name }}"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+{% macro get_deps(img_item) -%}
+{% if img_item.parent %}
+{{- get_deps(jupyter_images[img_item.parent]) }}
+{% endif %}
+
+{# Extract dependencies for the current layer #}
+{%- set dep_key = img_item.path | replace('-', '_') %}
+{%- if dep_key in ds_image_deps %}
+{%- for dep in ds_image_deps[dep_key] %}
+    "{{ dep }}",
+{%- endfor %}
+{%- endif %}
+{%- endmacro %}
+
+{# Execute the macro on the current image being built #}
+{{- get_deps(item) }}
+]
+
+[dependency-groups]
+dev = [
+{% for dep in ds_image_deps.dev %}
+    "{{ dep }}",
+{% endfor %}
+]
+
+{% if 'cpu' in item.name %}
+# Explicitly force CPU-only versions for PyTorch ecosystem on CPU images
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+{% endif %}

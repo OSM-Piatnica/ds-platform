@@ -1,0 +1,162 @@
+#!/bin/bash
+# ==============================================================================
+# PLATFORM BACKUP ORCHESTRATION SCRIPT
+# ==============================================================================
+# This script performs a "Dump, Snapshot, Prune" workflow:
+# 1. Dumps PostgreSQL databases from inside the container to a staging area.
+# 2. Uses Restic to take a deduplicated snapshot of data and configuration.
+# 3. Prunes old snapshots according to a retention policy.
+# ==============================================================================
+
+# Exit immediately if a command fails (-e), if an undefined variable is used (-u),
+# or if any command in a pipeline fails (-o pipefail).
+set -eou pipefail
+
+# Enable "globstar" (**) to allow recursive pattern matching in excludes.
+shopt -s globstar
+
+# ------------------------------------------------------------------------------
+# 1. CONFIGURATION & CREDENTIALS
+# ------------------------------------------------------------------------------
+
+# Define the current timestamp for naming database dump files.
+TIMESTAMP=$(date +"%Y%m%d%H%M")
+
+# Define path constants.
+BACKUP_ROOT="/srv/backups"
+RESTIC_REPO="${BACKUP_ROOT}/restic_repo"       # Where the Restic repository lives
+STAGING_DIR="${BACKUP_ROOT}/staging/postgres"  # Temporary holding area for SQL dumps
+SECRETS_DIR="{{ project_root }}/secrets"       # Ansible-injected path to secrets
+
+# Read Credentials from the secure files managed by Ansible.
+# We read these into variables to avoid hardcoding them in the script.
+PG_PASSWORD=$(cat "${SECRETS_DIR}/postgres_root_password.txt")
+
+# Export Restic environment variables so the binary can authenticate automatically.
+export RESTIC_PASSWORD=$(cat "${SECRETS_DIR}/restic_password.txt")
+export RESTIC_REPOSITORY="${RESTIC_REPO}"
+
+# Define the list of directories to include in the snapshot.
+# 1. STAGING_DIR: Contains the fresh SQL dumps we are about to generate.
+# 2. /srv: Contains all persistent volume data (JupyterHub users, Forgejo repos, etc.).
+# 3. {{ project_root }}: Contains the Infrastructure-as-Code (Ansible playbooks, configs).
+TARGETS=("${STAGING_DIR}" "/srv" "{{ project_root }}")
+
+# Define patterns to exclude from the backup to save space and avoid loops.
+EXCLUDES=(
+    # Exclude the repo directory to avoid backing up the backup data itself.
+    --exclude "${RESTIC_REPO}"
+    
+    # Exclude raw DB files; we rely on the SQL dumps in staging/ instead.
+    --exclude "/srv/postgresql_data"
+    --exclude "/srv/valkey_data"
+    
+    # Exclude JupyterHub "lost+found" directories to avoid permission errors.
+    --exclude "/srv/jupyterhub_data/users/*/lost+found"
+    
+    # Exclude cache directories (regeneratable data).
+    --exclude "**/.cache"
+    
+    # Exclude git internal folders (optional: saves space, but risky for restoration).
+    # We keep .git by default in {{ project_root }} but might exclude in user dirs.
+    # --exclude "**/.git" 
+    
+    # Exclude log files as they are high-churn and handled by Loki.
+    --exclude "*.log"
+)
+
+# ------------------------------------------------------------------------------
+# 2. PRE-FLIGHT CHECKS
+# ------------------------------------------------------------------------------
+
+# Verify the PostgreSQL container is running.
+# We cannot dump the database if the database server is offline.
+# Wrap the Docker format string in `raw` blocks, so Jinja2 doesn't parse it.
+if ! docker ps --format '{% raw %}{{.Names}}{% endraw %}' | grep -q "^postgresql$"; then
+    echo "[FATAL] PostgreSQL container is not running. Aborting backup."
+    exit 1
+fi
+
+# Ensure the required directories exist.
+mkdir -p "${STAGING_DIR}"
+mkdir -p "${RESTIC_REPO}"
+
+# Initialize the Restic repository if it does not exist.
+# This makes the script "self-healing" — the first run sets everything up.
+if ! restic snapshots > /dev/null 2>&1; then
+    echo "[INFO] Initializing new Restic repository at ${RESTIC_REPO}..."
+    restic init
+fi
+
+# ------------------------------------------------------------------------------
+# 3. PHASE 1: DATABASE EXPORT
+# ------------------------------------------------------------------------------
+echo "\n[INFO] Starting Phase 1: Database Dumps..."
+
+# Dynamically fetch non-system database names.
+# 1. Get list of DBs (excluding templates and 'postgres' system db)
+# 2. Use 'tr' to delete carriage returns (common docker/tty artifact)
+# 3. Use 'xargs -n1' to ensure each DB is on its own line and trimmed of spaces
+RAW_DB_LIST=$(docker exec postgresql bash -c 'export PGPASSWORD=$(cat /run/secrets/postgres_root_password); psql -U postgres_root -h localhost -t -c "SELECT datname FROM pg_database WHERE datistemplate = false AND datname != '"'postgres'"';"' | tr -d '\r' | xargs -n1)
+
+# Read into array.
+readarray -t DBS <<<"$RAW_DB_LIST"
+
+# Wrap in `raw` blocks to prevent Jinja2 from interpreting as a comment.
+if [ {% raw %}${#DBS[@]}{% endraw %} -eq 0 ]; then
+    echo "[WARN] No databases found to back up!"
+else
+    echo "[INFO] Found databases: ${DBS[*]}"
+fi
+
+for db in "${DBS[@]}"; do
+    # Skip empty lines if any
+    [[ -z "$db" ]] && continue
+    
+    DUMP_FILE="${STAGING_DIR}/${db}.sql.gz"
+    echo "  -> Dumping '${db}'..."
+    
+    ##
+    # Instead of passing the password from the host (visible in `ps aux`),
+    # we execute a bash shell INSIDE the container.
+    ##
+    # Run pg_dump INSIDE the container to ensure version compatibility.
+    # 1. -e PGPASSWORD=... : Pass auth env var safely to the container process.
+    # 2. -h localhost      : Connect to Postgres via loopback inside container.
+    # 3. --clean           : generated SQL will drop tables before creating them (easier restore).
+    # 4. | gzip --rsyncable: Compress on the HOST to save container CPU.
+    ##                       --rsyncable creates GZIPs friendly to deduplication.
+    docker exec postgresql bash -c 'export PGPASSWORD=$(cat /run/secrets/postgres_root_password); pg_dump -U postgres_root -h localhost --clean --if-exists "$1"' -- "${db}" | gzip --rsyncable > "${DUMP_FILE}"
+done
+
+# ------------------------------------------------------------------------------
+# 4. PHASE 2: RESTIC SNAPSHOT
+# ------------------------------------------------------------------------------
+echo "\n[INFO] Starting Phase 2: Restic Snapshot..."
+
+# Run the backup.
+# --tag allows us to identify these specific snapshots later (e.g. separate from manual ones).
+restic backup "${TARGETS[@]}" "${EXCLUDES[@]}" \
+    --tag "scheduled-backup"
+
+# ------------------------------------------------------------------------------
+# 5. PHASE 3: MAINTENANCE & CLEANUP
+# ------------------------------------------------------------------------------
+echo "\n[INFO] Starting Phase 3: Pruning Old Backups..."
+
+# Apply retention policy:
+# Keep last 7 daily snapshots
+# Keep last 4 weekly snapshots
+# Keep last 6 monthly snapshots
+# --prune deletes the actual data blocks from disk.
+restic forget \
+    --keep-daily 7 \
+    --keep-weekly 4 \
+    --keep-monthly 6 \
+    --prune
+
+echo "[INFO] Cleaning up staging area..."
+# Remove the SQL dump files. They are now safely inside the Restic snapshot.
+rm -f "${STAGING_DIR}"/*.sql.gz
+
+echo "[SUCCESS] Backup process completed at $(date)."

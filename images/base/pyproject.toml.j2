@@ -1,0 +1,23 @@
+# images/base/pyproject.toml
+
+[project]
+name = "base_image"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+
+    # Base Jupyter dependencies
+{% for dep in ds_image_deps.base %}
+    "{{ dep }}",
+{% endfor %}
+
+]
+
+[dependency-groups]
+dev = [
+
+{% for dep in ds_image_deps.dev %}
+    "{{ dep }}",
+{% endfor %}
+
+]
