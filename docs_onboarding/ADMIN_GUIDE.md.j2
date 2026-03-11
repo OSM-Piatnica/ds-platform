@@ -169,11 +169,17 @@ To minimize the attack surface, **only** the Caddy Reverse Proxy container liste
   |----------|----------|---|------|
   |          |          |          |
 [Auth]  [JupyterHub] [Forgejo] [Grafana]
+             |
+         (Spawns)
+             |
+    [Project Containers]
+
+=============================================
+ (Dual-Homed Services connecting to Backend)
+=============================================
   |          |          |          |
-  |       (Spawns)      |          |
+[Auth]  [JupyterHub] [Forgejo] [Grafana]
   |          |          |          |
-  |  [Project Containers]          |
-  |                                |
 (Docker: ds-backend-net)           |
   |----------|----------|----------|
   |          |          |
@@ -186,31 +192,66 @@ To minimize the attack surface, **only** the Caddy Reverse Proxy container liste
 
 ```mermaid
 flowchart TD
-    VPN([Internet / Corporate VPN])
-    VPN -->|TCP: 80 / 443| Caddy[Caddy Reverse Proxy]
-    VPN -->|TCP: 222 SSH| Forgejo[Forgejo Git Server]
+    %% Styling Classes
+    classDef external fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#000
+    classDef dualHomed fill:#e1d5e7,stroke:#9673a6,stroke-width:2px,color:#000
+    classDef frontend fill:#d5e8d4,stroke:#82b366,stroke-width:2px,color:#000
+    classDef backend fill:#dae8fc,stroke:#6c8ebf,stroke-width:2px,color:#000
 
-    subgraph FrontEnd [Docker Network: ds-frontend-net]
-        Caddy --> Auth[Authelia]
-        Caddy --> JHub[JupyterHub]
-        Caddy --> Forgejo
-        Caddy --> Grafana[Grafana]
+    %% External Entities
+    VPN([Internet / Corporate VPN]):::external
+    Admin([Admin / SSH Tunnel]):::external
+
+    %% Subgraphs representing Docker Networks
+    subgraph FrontEnd [ds-frontend-net]
+        Caddy[Caddy Reverse Proxy]:::frontend
+        Auth[Authelia]:::dualHomed
+        JHub[JupyterHub / Internal Proxy]:::dualHomed
+        Forgejo[Forgejo Git Server]:::dualHomed
+        Grafana[Grafana]:::dualHomed
+        Projects[Project Containers / Named Servers]:::frontend
+
+        %% Internal Frontend Routing
+        Caddy -->|Reverse Proxy| Auth
+        Caddy -->|Reverse Proxy| JHub
+        Caddy -->|Reverse Proxy| Forgejo
+        Caddy -->|Reverse Proxy| Grafana
+
+        %% Workspace Orchestration
+        JHub -.->|Spawns & Proxies Traffic| Projects
     end
 
-    JHub -.->|Spawns & Manages| Projects[Project Containers / Named Servers]
+    subgraph BackEnd [ds-backend-net]
+        DB[(PostgreSQL)]:::backend
+        Cache[(Valkey)]:::backend
+        Alloy[Grafana Alloy]:::backend
+        Prom[Prometheus]:::backend
+        Loki[Loki]:::backend
 
-    subgraph BackEnd [Docker Network: ds-backend-net]
-        Projects
-        Auth --> DB[(PostgreSQL)]
-        JHub --> DB
-        Forgejo --> DB
-        Auth --> Cache[(Valkey)]
-        
-        Observability[Grafana Alloy / Prometheus / Loki]
+        %% Internal Backend Routing
+        Alloy -->|Pushes Metrics| Prom
+        Alloy -->|Pushes Logs| Loki
     end
 
-    Admin([Admin / SSH Tunnel]) -.->|127.0.0.1 Binding| Observability
-    Admin -.->|127.0.0.1 Binding| DB
+    %% Ingress Traffic (External to Frontend)
+    VPN -->|TCP: 80 / 443| Caddy
+    VPN -->|TCP: 222 SSH| Forgejo
+
+    %% Cross-Network Interactions
+    Auth --> DB
+    JHub --> DB
+    Forgejo --> DB
+    Grafana --> DB
+    Auth --> Cache
+    %% Observability Data Flow
+    Grafana -->|Queries| Prom
+    Grafana -->|Queries| Loki
+
+    %% Admin Access Bindings
+    Admin -.->|127.0.0.1:12345| Alloy
+    Admin -.->|127.0.0.1:9090| Prom
+    Admin -.->|127.0.0.1:3100| Loki
+    Admin -.->|Docker Exec| DB
 ```
 
 ---
